@@ -67,12 +67,12 @@ team_members = {}
 # {(chat_id, message_id): {"current": user_id, "declined": set(user_id), "confirmed": bool}}
 daily_picks = {}
 
-# Тестировщик по чатам (один на чат).
-# {chat_id: {"user_id", "username", "full_name"}}
+# Тестировщики по чатам (можно несколько).
+# {chat_id: [{"user_id", "username", "full_name"}, ...]}
 testers = {}
 
 # Активные голосования по тестовой среде.
-# {(chat_id, message_id): {"score": int|None, "closed": bool}}
+# {(chat_id, message_id): {"votes": {user_id: (name, score)}, "closed": bool}}
 env_polls = {}
 
 
@@ -106,11 +106,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📊 Голосование за спринт (пт 12:00 МСК, раз в 2 недели):\n"
         "/startpoll — запустить голосование вручную прямо сейчас\n"
         "/closepoll — досрочно закрыть голосование и показать среднее\n\n"
-        "🧪 Оценка тестовой среды (пт 12:01 МСК, раз в 2 недели, голосует тестировщик):\n"
-        "/registertester — зарегистрироваться тестировщиком этого чата\n"
-        "/unregistertester — снять регистрацию\n"
-        "/tester — показать зарегистрированного тестировщика\n"
-        "/startenvpoll — запустить голосование по тестовой среде вручную\n\n"
+        "🧪 Оценка тестовой среды (пт 12:01 МСК, раз в 2 недели, голосуют тестировщики, считается среднее):\n"
+        "/registertester — добавить себя в список тестировщиков\n"
+        "/unregistertester — убрать себя из списка\n"
+        "/testers — показать список тестировщиков\n"
+        "/startenvpoll — запустить голосование по тестовой среде вручную\n"
+        "/closeenvpoll — досрочно закрыть голосование и показать среднее\n\n"
         "🎲 Случайный фасилитатор дейли (каждый будний день в 11:59 МСК):\n"
         "/joindaily — добавить себя в список фасилитаторов\n"
         "/leavedaily — убрать себя из списка\n"
@@ -324,9 +325,9 @@ async def send_sprint_poll(app, chat_id: int):
 
 async def vote_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     parts = query.data.split(":")
     if len(parts) != 3 or parts[0] != "vote":
+        await query.answer()
         return
     poll_id = int(parts[1])
     score = int(parts[2])
@@ -341,6 +342,7 @@ async def vote_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = query.from_user
     is_new = user.id not in poll["votes"]
     poll["votes"][user.id] = (user.full_name, score)
+    await query.answer("Голос принят")
 
     try:
         await query.edit_message_text(
@@ -487,9 +489,9 @@ async def send_daily_pick(app, chat_id: int):
 
 async def daily_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     parts = query.data.split(":")
     if len(parts) != 2 or parts[0] != "dpick":
+        await query.answer()
         return
     action = parts[1]
     chat_id = query.message.chat_id
@@ -515,6 +517,7 @@ async def daily_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             text=f"✅ Дейли проводит: {mention}",
             parse_mode="HTML",
         )
+        await query.answer("Принято")
         return
 
     if action == "no":
@@ -525,6 +528,7 @@ async def daily_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             await query.edit_message_text(
                 text="🤷 Все отказались. Договоритесь сами, кто проводит дейли."
             )
+            await query.answer()
             return
         new_chosen = random.choice(candidates)
         pick["current"] = new_chosen["user_id"]
@@ -537,6 +541,7 @@ async def daily_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             reply_markup=build_pick_keyboard(),
             parse_mode="HTML",
         )
+        await query.answer("Выбрана замена")
 
 
 async def picknow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -607,54 +612,54 @@ async def setsprintstart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 # ============================================================
-# Голосование по тестовой среде (только тестировщик, 0–5)
+# Голосование по тестовой среде (тестировщики, 0–5, среднее)
 # ============================================================
 async def registertester_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user = update.effective_user
-    prev = testers.get(chat_id)
-    testers[chat_id] = {
+    chat_testers = testers.setdefault(chat_id, [])
+    for t in chat_testers:
+        if t["user_id"] == user.id:
+            t["username"] = user.username
+            t["full_name"] = user.full_name
+            await update.message.reply_text("Ты уже в списке тестировщиков (профиль обновлён).")
+            return
+    chat_testers.append({
         "user_id": user.id,
         "username": user.username,
         "full_name": user.full_name,
-    }
-    if prev and prev["user_id"] != user.id:
-        await update.message.reply_text(
-            f"✅ Тестировщик чата заменён: {prev['full_name']} → {user.full_name}."
-        )
-    else:
-        await update.message.reply_text(
-            f"✅ {user.full_name} зарегистрирован как тестировщик. "
-            f"Голосование по тестовой среде будет приходить тебе раз в 2 недели."
-        )
+    })
+    await update.message.reply_text(
+        f"✅ {user.full_name} добавлен в список тестировщиков. "
+        f"Сейчас в списке: {len(chat_testers)}."
+    )
 
 
 async def unregistertester_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user = update.effective_user
-    tester = testers.get(chat_id)
-    if not tester:
-        await update.message.reply_text("В этом чате нет зарегистрированного тестировщика.")
+    chat_testers = testers.get(chat_id, [])
+    new_list = [t for t in chat_testers if t["user_id"] != user.id]
+    if len(new_list) == len(chat_testers):
+        await update.message.reply_text("Тебя и не было в списке тестировщиков.")
         return
-    if tester["user_id"] != user.id:
-        await update.message.reply_text(
-            "Снять регистрацию может только сам тестировщик."
-        )
-        return
-    del testers[chat_id]
-    await update.message.reply_text("🗑 Тестировщик снят с регистрации.")
+    testers[chat_id] = new_list
+    await update.message.reply_text("🗑 Удалил тебя из списка тестировщиков.")
 
 
 async def tester_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    tester = testers.get(chat_id)
-    if not tester:
+    chat_testers = testers.get(chat_id, [])
+    if not chat_testers:
         await update.message.reply_text(
-            "Тестировщик не зарегистрирован. Пусть напишет /registertester."
+            "Тестировщики не зарегистрированы. Пусть напишут /registertester."
         )
         return
-    suffix = f" (@{tester['username']})" if tester.get("username") else ""
-    await update.message.reply_text(f"🧪 Тестировщик: {tester['full_name']}{suffix}")
+    lines = ["🧪 Тестировщики:"]
+    for t in chat_testers:
+        suffix = f" (@{t['username']})" if t.get("username") else ""
+        lines.append(f"• {t['full_name']}{suffix}")
+    await update.message.reply_text("\n".join(lines))
 
 
 def build_env_keyboard() -> InlineKeyboardMarkup:
@@ -663,32 +668,40 @@ def build_env_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def env_poll_text(chat_id: int, votes: dict) -> str:
+    chat_testers = testers.get(chat_id, [])
+    mentions = " ".join(member_mention(t) for t in chat_testers)
+    return (
+        "🧪 Оценка тестовой среды за спринт\n"
+        f"{mentions}, поставьте оценку от 0 до 5.\n\n"
+        f"Проголосовало: {len(votes)}/{len(chat_testers)}"
+    )
+
+
 async def send_env_poll(app, chat_id: int):
-    tester = testers.get(chat_id)
-    if not tester:
-        log.info("Skipping env poll for chat %s — no tester registered", chat_id)
+    chat_testers = testers.get(chat_id, [])
+    if not chat_testers:
+        log.info("Skipping env poll for chat %s — no testers registered", chat_id)
         return
     msg = await app.bot.send_message(
         chat_id=chat_id,
-        text=(
-            f"🧪 Оценка тестовой среды за спринт\n"
-            f"{member_mention(tester)}, поставь оценку от 0 до 5."
-        ),
+        text=env_poll_text(chat_id, {}),
         reply_markup=build_env_keyboard(),
         parse_mode="HTML",
     )
-    env_polls[(chat_id, msg.message_id)] = {"score": None, "closed": False}
+    env_polls[(chat_id, msg.message_id)] = {"votes": {}, "closed": False}
 
 
 async def env_vote_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     parts = query.data.split(":")
     if len(parts) != 2 or parts[0] != "envvote":
+        await query.answer()
         return
     try:
         score = int(parts[1])
     except ValueError:
+        await query.answer()
         return
     chat_id = query.message.chat_id
     key = (chat_id, query.message.message_id)
@@ -699,31 +712,67 @@ async def env_vote_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if poll["closed"]:
         await query.answer("Голосование уже закрыто.", show_alert=True)
         return
-    tester = testers.get(chat_id)
+    chat_testers = testers.get(chat_id, [])
+    tester = next((t for t in chat_testers if t["user_id"] == query.from_user.id), None)
     if not tester:
-        await query.answer("Тестировщик в чате не зарегистрирован.", show_alert=True)
-        return
-    if query.from_user.id != tester["user_id"]:
-        await query.answer("Голосует только зарегистрированный тестировщик.", show_alert=True)
+        await query.answer("Голосуют только зарегистрированные тестировщики.", show_alert=True)
         return
 
-    poll["score"] = score
-    poll["closed"] = True
+    is_new = tester["user_id"] not in poll["votes"]
+    poll["votes"][tester["user_id"]] = (tester["full_name"], score)
+    await query.answer("Оценка принята")
+
     try:
         await query.edit_message_text(
-            text=(
-                f"🧪 Оценка тестовой среды — итог\n"
-                f"Оценил: {member_mention(tester)}\n"
-                f"Оценка: {score}/5"
-            ),
+            text=env_poll_text(chat_id, poll["votes"]),
+            reply_markup=build_env_keyboard(),
             parse_mode="HTML",
         )
     except Exception as e:
         log.warning("env poll edit failed: %s", e)
 
+    if is_new and len(poll["votes"]) >= len(chat_testers):
+        await close_env_poll(context.application, key)
+
+
+async def close_env_poll(app, key):
+    poll = env_polls.get(key)
+    if not poll or poll["closed"]:
+        return
+    poll["closed"] = True
+    chat_id, message_id = key
+    votes = poll["votes"]
+    chat_testers = testers.get(chat_id, [])
+    if not votes:
+        text = "🧪 Оценка тестовой среды — голосование закрыто. Никто не оценил."
+    else:
+        scores = [s for _, s in votes.values()]
+        avg = sum(scores) / len(scores)
+        lines = [f"• {name}: {score}/5" for name, score in votes.values()]
+        text = (
+            "🧪 Оценка тестовой среды — итог\n"
+            f"Проголосовало: {len(votes)}/{len(chat_testers)}\n"
+            f"Средняя: {avg:.2f}/5\n\n" + "\n".join(lines)
+        )
+    try:
+        await app.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text)
+    except Exception as e:
+        log.warning("close_env_poll edit failed: %s", e)
+        await app.bot.send_message(chat_id=chat_id, text=text)
+
 
 async def startenvpoll_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_env_poll(context.application, update.effective_chat.id)
+
+
+async def closeenvpoll_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    open_keys = [k for k, p in env_polls.items() if k[0] == chat_id and not p["closed"]]
+    if not open_keys:
+        await update.message.reply_text("В этом чате нет активных голосований по тестовой среде.")
+        return
+    # Берём самое позднее по message_id
+    await close_env_poll(context.application, max(open_keys, key=lambda k: k[1]))
 
 
 # ============================================================
@@ -816,7 +865,9 @@ def main():
     app.add_handler(CommandHandler("registertester", registertester_cmd))
     app.add_handler(CommandHandler("unregistertester", unregistertester_cmd))
     app.add_handler(CommandHandler("tester", tester_cmd))
+    app.add_handler(CommandHandler("testers", tester_cmd))
     app.add_handler(CommandHandler("startenvpoll", startenvpoll_cmd))
+    app.add_handler(CommandHandler("closeenvpoll", closeenvpoll_cmd))
 
     app.add_handler(CommandHandler("settings", settings_cmd))
     app.add_handler(CommandHandler("setteamsize", setteamsize_cmd))
