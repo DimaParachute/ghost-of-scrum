@@ -1,7 +1,10 @@
 import html
+import json
 import logging
-import random
 import os
+import random
+import shutil
+import tempfile
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -29,6 +32,10 @@ SPRINT_POLL_TIME = "12:00"
 
 # Время голосования по тестовой среде (тот же день, через минуту)
 ENV_POLL_TIME = "12:01"
+
+# Файл с персистентным состоянием. Можно переопределить через STATE_PATH в env.
+STATE_PATH = os.environ.get("STATE_PATH", "state.json")
+STATE_VERSION = 1
 
 # ============================================================
 
@@ -81,6 +88,210 @@ scrum_masters = {}
 # Дни рождения по чатам.
 # {chat_id: {user_id: {"username", "full_name", "month", "day"}}}
 birthdays = {}
+
+# Пользовательские напоминания (/daily, /weekly, /biweekly).
+# {job_id: {"type", "chat_id", "day"|None, "hour", "minute", "text"}}
+user_reminders = {}
+
+
+# ============================================================
+# Персистентность (JSON)
+# ============================================================
+def _serialize_state() -> dict:
+    """Собирает текущее in-memory состояние в сериализуемую структуру."""
+    return {
+        "_version": STATE_VERSION,
+        "chat_configs": {str(cid): cfg for cid, cfg in chat_configs.items()},
+        "team_members": {str(cid): members for cid, members in team_members.items()},
+        "testers": {str(cid): tlist for cid, tlist in testers.items()},
+        "scrum_masters": {str(cid): sm for cid, sm in scrum_masters.items()},
+        "birthdays": {
+            str(cid): {str(uid): b for uid, b in chat_b.items()}
+            for cid, chat_b in birthdays.items()
+        },
+        "polls": [
+            {
+                "poll_id": pid,
+                "chat_id": p["chat_id"],
+                "message_id": p["message_id"],
+                "votes": [[uid, name, score] for uid, (name, score) in p["votes"].items()],
+                "closed": p["closed"],
+            }
+            for pid, p in polls.items()
+        ],
+        "poll_counter": poll_counter,
+        "env_polls": [
+            {
+                "chat_id": cid,
+                "message_id": mid,
+                "votes": [[uid, name, score] for uid, (name, score) in p["votes"].items()],
+                "closed": p["closed"],
+            }
+            for (cid, mid), p in env_polls.items()
+        ],
+        "daily_picks": [
+            {
+                "chat_id": cid,
+                "message_id": mid,
+                "current": p["current"],
+                "declined": list(p["declined"]),
+                "confirmed": p["confirmed"],
+            }
+            for (cid, mid), p in daily_picks.items()
+        ],
+        "user_reminders": list(user_reminders.values()),
+    }
+
+
+def save_state():
+    """Атомарная запись state в JSON: сначала во временный файл, затем os.replace."""
+    try:
+        data = _serialize_state()
+        directory = os.path.dirname(os.path.abspath(STATE_PATH)) or "."
+        fd, tmp_path = tempfile.mkstemp(prefix=".state.", suffix=".tmp", dir=directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, STATE_PATH)
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+    except Exception as e:
+        log.exception("save_state failed: %s", e)
+
+
+# Миграции схемы. Ключ — текущая версия, значение — функция, повышающая на +1.
+# Пока пусто; первая запись появится, когда понадобится breaking-change.
+MIGRATIONS: dict = {}
+
+
+def _migrate(data: dict) -> dict:
+    v = data.get("_version", 1)
+    if v > STATE_VERSION:
+        raise RuntimeError(
+            f"State version {v} новее, чем поддерживает код ({STATE_VERSION}). Обнови бота."
+        )
+    while v < STATE_VERSION:
+        if v not in MIGRATIONS:
+            raise RuntimeError(f"Нет миграции с версии {v} на {v + 1}.")
+        backup_path = f"{STATE_PATH}.v{v}.bak.json"
+        try:
+            shutil.copy2(STATE_PATH, backup_path)
+            log.info("State backup saved to %s", backup_path)
+        except Exception as e:
+            log.warning("Couldn't make backup before migration: %s", e)
+        data = MIGRATIONS[v](data)
+        v += 1
+        data["_version"] = v
+    return data
+
+
+def load_state():
+    """Читает state.json и заполняет глобальные структуры. Тихо игнорирует отсутствие файла."""
+    global poll_counter
+    if not os.path.exists(STATE_PATH):
+        log.info("No state file found at %s — starting fresh", STATE_PATH)
+        return
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        log.exception("Cannot read %s: %s", STATE_PATH, e)
+        return
+
+    data = _migrate(data)
+
+    chat_configs.clear()
+    for cid, cfg in data.get("chat_configs", {}).items():
+        chat_configs[int(cid)] = {
+            "team_size": cfg.get("team_size", DEFAULT_TEAM_SIZE),
+            "sprint_start": cfg.get("sprint_start", DEFAULT_SPRINT_START_DATE),
+        }
+
+    team_members.clear()
+    for cid, members in data.get("team_members", {}).items():
+        team_members[int(cid)] = list(members)
+
+    testers.clear()
+    for cid, tlist in data.get("testers", {}).items():
+        testers[int(cid)] = list(tlist)
+
+    scrum_masters.clear()
+    for cid, sm in data.get("scrum_masters", {}).items():
+        scrum_masters[int(cid)] = sm
+
+    birthdays.clear()
+    for cid, chat_b in data.get("birthdays", {}).items():
+        birthdays[int(cid)] = {int(uid): b for uid, b in chat_b.items()}
+
+    polls.clear()
+    for p in data.get("polls", []):
+        polls[p["poll_id"]] = {
+            "chat_id": p["chat_id"],
+            "message_id": p["message_id"],
+            "votes": {uid: (name, score) for uid, name, score in p.get("votes", [])},
+            "closed": p.get("closed", False),
+        }
+
+    poll_counter = data.get("poll_counter", 0)
+
+    env_polls.clear()
+    for p in data.get("env_polls", []):
+        env_polls[(p["chat_id"], p["message_id"])] = {
+            "votes": {uid: (name, score) for uid, name, score in p.get("votes", [])},
+            "closed": p.get("closed", False),
+        }
+
+    daily_picks.clear()
+    for p in data.get("daily_picks", []):
+        daily_picks[(p["chat_id"], p["message_id"])] = {
+            "current": p["current"],
+            "declined": set(p.get("declined", [])),
+            "confirmed": p.get("confirmed", False),
+        }
+
+    user_reminders.clear()
+    for r in data.get("user_reminders", []):
+        user_reminders[r["job_id"]] = r
+
+    log.info(
+        "State loaded: %d chats, %d polls, %d env polls, %d daily picks, %d user reminders",
+        len(chat_configs), len(polls), len(env_polls), len(daily_picks), len(user_reminders),
+    )
+
+
+def restore_user_reminders(app):
+    """Воссоздаёт пользовательские напоминания (/daily, /weekly, /biweekly) из user_reminders."""
+    for r in user_reminders.values():
+        try:
+            if r["type"] == "daily":
+                trigger = CronTrigger(
+                    day_of_week="mon-fri",
+                    hour=r["hour"], minute=r["minute"], timezone=TIMEZONE,
+                )
+            elif r["type"] == "weekly":
+                trigger = CronTrigger(
+                    day_of_week=r["day"],
+                    hour=r["hour"], minute=r["minute"], timezone=TIMEZONE,
+                )
+            elif r["type"] == "biweekly":
+                first_run = next_biweekly_run(r["day"], r["hour"], r["minute"], r["chat_id"])
+                trigger = IntervalTrigger(weeks=2, start_date=first_run)
+            else:
+                log.warning("Unknown reminder type: %s", r.get("type"))
+                continue
+            scheduler.add_job(
+                send_message,
+                trigger=trigger,
+                args=[app, r["chat_id"], f"⏰ {r['text']}"],
+                id=r["job_id"],
+                replace_existing=True,
+            )
+        except Exception as e:
+            log.warning("Failed to restore reminder %s: %s", r.get("job_id"), e)
 
 
 def parse_time(s: str):
@@ -203,6 +414,7 @@ async def setchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cfg = get_chat_config(chat_id)
     schedule_sprint_poll(context.application, chat_id)
     schedule_env_poll(context.application, chat_id)
+    save_state()
     if is_new:
         await update.message.reply_text(
             f"✅ Этот чат добавлен в рабочие (ID: {chat_id}).\n"
@@ -229,6 +441,7 @@ async def unsetchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         job = scheduler.get_job(job_id)
         if job:
             job.remove()
+    save_state()
     await update.message.reply_text(
         f"🗑 Чат снят с роли рабочего (ID: {chat_id}). "
         f"Голосования за спринт и тестовую среду больше не будут приходить автоматически."
@@ -264,6 +477,11 @@ async def daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         id=job_id,
         replace_existing=True,
     )
+    user_reminders[job_id] = {
+        "job_id": job_id, "type": "daily", "chat_id": chat_id,
+        "day": None, "hour": hour, "minute": minute, "text": text,
+    }
+    save_state()
     await update.message.reply_text(
         f"✅ Дейли (пн–пт в {hour:02d}:{minute:02d}) добавлен.\nID: {job_id}"
     )
@@ -295,6 +513,11 @@ async def weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         id=job_id,
         replace_existing=True,
     )
+    user_reminders[job_id] = {
+        "job_id": job_id, "type": "weekly", "chat_id": chat_id,
+        "day": day, "hour": hour, "minute": minute, "text": text,
+    }
+    save_state()
     await update.message.reply_text(
         f"✅ Еженедельно ({day} {hour:02d}:{minute:02d}) добавлено.\nID: {job_id}"
     )
@@ -328,6 +551,11 @@ async def biweekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         id=job_id,
         replace_existing=True,
     )
+    user_reminders[job_id] = {
+        "job_id": job_id, "type": "biweekly", "chat_id": chat_id,
+        "day": day, "hour": hour, "minute": minute, "text": text,
+    }
+    save_state()
     await update.message.reply_text(
         f"✅ Раз в 2 недели ({day} {hour:02d}:{minute:02d}) добавлено.\n"
         f"Первый запуск: {first_run.strftime('%Y-%m-%d %H:%M')}\nID: {job_id}"
@@ -374,6 +602,8 @@ async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Не нашёл напоминание с таким ID.")
         return
     job.remove()
+    user_reminders.pop(job_id, None)
+    save_state()
     await update.message.reply_text(f"🗑 Удалено: {job_id}")
 
 
@@ -422,6 +652,7 @@ async def send_sprint_poll(app, chat_id: int):
         reply_markup=build_poll_keyboard(poll_id),
     )
     polls[poll_id]["message_id"] = msg.message_id
+    save_state()
 
 
 async def vote_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -443,6 +674,7 @@ async def vote_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = query.from_user
     is_new = user.id not in poll["votes"]
     poll["votes"][user.id] = (user.full_name, score)
+    save_state()
     await query.answer("Голос принят")
 
     try:
@@ -462,6 +694,7 @@ async def close_poll(app, poll_id: int):
     if not poll or poll["closed"]:
         return
     poll["closed"] = True
+    save_state()
     votes = poll["votes"]
     if not votes:
         text = "📊 Голосование закрыто. Никто не проголосовал."
@@ -526,6 +759,7 @@ async def joindaily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if m["user_id"] == user.id:
                 m["username"] = user.username
                 m["full_name"] = user.full_name
+        save_state()
         await update.message.reply_text("Ты уже в списке фасилитаторов дейли (профиль обновлён).")
         return
     members.append({
@@ -533,6 +767,7 @@ async def joindaily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "username": user.username,
         "full_name": user.full_name,
     })
+    save_state()
     await update.message.reply_text(
         f"✅ {user.full_name} добавлен в список фасилитаторов дейли. Сейчас в списке: {len(members)}."
     )
@@ -557,6 +792,7 @@ async def addfacilitator_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if m["user_id"] == target.id:
             m["username"] = target.username
             m["full_name"] = target.full_name
+            save_state()
             await update.message.reply_text(
                 f"{target.full_name} уже в списке фасилитаторов (профиль обновлён)."
             )
@@ -566,6 +802,7 @@ async def addfacilitator_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "username": target.username,
         "full_name": target.full_name,
     })
+    save_state()
     await update.message.reply_text(
         f"✅ {target.full_name} добавлен в список фасилитаторов. Сейчас в списке: {len(members)}."
     )
@@ -588,6 +825,7 @@ async def removefacilitator_cmd(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text(f"{target.full_name} не было в списке фасилитаторов.")
         return
     team_members[chat_id] = new_members
+    save_state()
     await update.message.reply_text(
         f"🗑 {target.full_name} удалён из списка фасилитаторов."
     )
@@ -602,6 +840,7 @@ async def leavedaily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Тебя и не было в списке.")
         return
     team_members[chat_id] = new_members
+    save_state()
     await update.message.reply_text("🗑 Удалил тебя из списка фасилитаторов дейли.")
 
 
@@ -656,6 +895,7 @@ async def send_daily_pick(app, chat_id: int):
         "declined": set(),
         "confirmed": False,
     }
+    save_state()
 
 
 async def daily_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -683,6 +923,7 @@ async def daily_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if action == "ok":
         pick["confirmed"] = True
+        save_state()
         mention = member_mention(current_member) if current_member else query.from_user.full_name
         await query.edit_message_text(
             text=f"✅ Дейли проводит: {mention}",
@@ -696,6 +937,7 @@ async def daily_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         candidates = [m for m in members if m["user_id"] not in pick["declined"]]
         if not candidates:
             del daily_picks[key]
+            save_state()
             await query.edit_message_text(
                 text="🤷 Все отказались. Договоритесь сами, кто проводит дейли."
             )
@@ -703,6 +945,7 @@ async def daily_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
         new_chosen = random.choice(candidates)
         pick["current"] = new_chosen["user_id"]
+        save_state()
         await query.edit_message_text(
             text=(
                 f"🔄 {member_mention(current_member) if current_member else 'Предыдущий'} не сможет.\n"
@@ -776,6 +1019,7 @@ async def setteamsize_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Сначала сделай /setchat в этом чате.")
         return
     chat_configs[chat_id]["team_size"] = n
+    save_state()
     await update.message.reply_text(f"✅ team_size = {n} (для этого чата)")
 
 
@@ -795,6 +1039,7 @@ async def setsprintstart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     chat_configs[chat_id]["sprint_start"] = context.args[0]
     schedule_sprint_poll(context.application, chat_id)
     schedule_env_poll(context.application, chat_id)
+    save_state()
     await update.message.reply_text(f"✅ sprint_start = {context.args[0]} (для этого чата)")
 
 
@@ -810,6 +1055,7 @@ async def registerscrum_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "username": user.username,
         "full_name": user.full_name,
     }
+    save_state()
     if prev and prev["user_id"] != user.id:
         await update.message.reply_text(
             f"✅ Скрам-мастер заменён: {prev['full_name']} → {user.full_name}."
@@ -832,6 +1078,7 @@ async def unregisterscrum_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("Снять регистрацию может только сам скрам-мастер.")
         return
     del scrum_masters[chat_id]
+    save_state()
     await update.message.reply_text("🗑 Скрам-мастер снят с регистрации.")
 
 
@@ -868,6 +1115,7 @@ async def setscrum_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "username": target.username,
         "full_name": target.full_name,
     }
+    save_state()
     if prev and prev["user_id"] != target.id:
         await update.message.reply_text(
             f"✅ Скрам-мастер заменён: {prev['full_name']} → {target.full_name}."
@@ -888,6 +1136,7 @@ async def unsetscrum_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("В этом чате нет зарегистрированного скрам-мастера.")
         return
     del scrum_masters[chat_id]
+    save_state()
     await update.message.reply_text(f"🗑 {sm['full_name']} снят с роли скрам-мастера.")
 
 
@@ -934,6 +1183,7 @@ async def setbirthday_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "month": month,
         "day": day,
     }
+    save_state()
     await update.message.reply_text(
         f"🎂 День рождения {full_name} сохранён: {day:02d}.{month:02d}."
     )
@@ -960,6 +1210,7 @@ async def removebirthday_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text(f"У {full_name} нет сохранённого дня рождения.")
         return
     del chat_bdays[user_id]
+    save_state()
     await update.message.reply_text(f"🗑 День рождения {full_name} удалён.")
 
 
@@ -1040,6 +1291,7 @@ async def registertester_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if t["user_id"] == user.id:
             t["username"] = user.username
             t["full_name"] = user.full_name
+            save_state()
             await update.message.reply_text("Ты уже в списке тестировщиков (профиль обновлён).")
             return
     chat_testers.append({
@@ -1047,6 +1299,7 @@ async def registertester_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "username": user.username,
         "full_name": user.full_name,
     })
+    save_state()
     await update.message.reply_text(
         f"✅ {user.full_name} добавлен в список тестировщиков. "
         f"Сейчас в списке: {len(chat_testers)}."
@@ -1072,6 +1325,7 @@ async def addtester_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if t["user_id"] == target.id:
             t["username"] = target.username
             t["full_name"] = target.full_name
+            save_state()
             await update.message.reply_text(
                 f"{target.full_name} уже в списке тестировщиков (профиль обновлён)."
             )
@@ -1081,6 +1335,7 @@ async def addtester_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "username": target.username,
         "full_name": target.full_name,
     })
+    save_state()
     await update.message.reply_text(
         f"✅ {target.full_name} добавлен в список тестировщиков. Сейчас в списке: {len(chat_testers)}."
     )
@@ -1103,6 +1358,7 @@ async def removetester_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"{target.full_name} не было в списке тестировщиков.")
         return
     testers[chat_id] = new_list
+    save_state()
     await update.message.reply_text(
         f"🗑 {target.full_name} удалён из списка тестировщиков."
     )
@@ -1117,6 +1373,7 @@ async def unregistertester_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("Тебя и не было в списке тестировщиков.")
         return
     testers[chat_id] = new_list
+    save_state()
     await update.message.reply_text("🗑 Удалил тебя из списка тестировщиков.")
 
 
@@ -1163,6 +1420,7 @@ async def send_env_poll(app, chat_id: int):
         parse_mode="HTML",
     )
     env_polls[(chat_id, msg.message_id)] = {"votes": {}, "closed": False}
+    save_state()
 
 
 async def env_vote_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1193,6 +1451,7 @@ async def env_vote_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     is_new = tester["user_id"] not in poll["votes"]
     poll["votes"][tester["user_id"]] = (tester["full_name"], score)
+    save_state()
     await query.answer("Оценка принята")
 
     try:
@@ -1213,6 +1472,7 @@ async def close_env_poll(app, key):
     if not poll or poll["closed"]:
         return
     poll["closed"] = True
+    save_state()
     chat_id, message_id = key
     votes = poll["votes"]
     chat_testers = testers.get(chat_id, [])
@@ -1320,12 +1580,14 @@ async def send_message(app, chat_id, text):
 # Entry
 # ============================================================
 async def post_init(app):
+    load_state()
     scheduler.start()
     for chat_id in list(chat_configs.keys()):
         schedule_sprint_poll(app, chat_id)
         schedule_env_poll(app, chat_id)
     schedule_daily_pick(app)
     schedule_birthday_check(app)
+    restore_user_reminders(app)
     log.info("Scheduler started")
 
 

@@ -5,6 +5,12 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .env
+
+# Persistent state — содержит данные конкретной инсталляции, в репо не попадает.
+state.json
+state*.bak.json
+state*.broken*
+
 .vscode/
 .idea/
 .DS_Store
