@@ -552,7 +552,7 @@ async def send_daily_pick(app, chat_id: int):
         return
     chosen = random.choice(members)
     text = (
-        f"🎲 Сегодня дейли проводит: {member_mention(chosen)}\n\n"
+        f"🎲 Следующий дейли проводит: {member_mention(chosen)}\n\n"
         f"Сможешь? Нажми кнопку ниже."
     )
     msg = await app.bot.send_message(
