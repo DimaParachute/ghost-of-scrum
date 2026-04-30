@@ -19,12 +19,9 @@ from apscheduler.triggers.interval import IntervalTrigger
 TOKEN = os.environ["TG_BOT_TOKEN"]
 TIMEZONE = "Europe/Moscow"
 
-# Сколько человек в команде — нужно для голосования за спринт
-TEAM_SIZE = 6
-
-# Дата начала первого спринта (ГГГГ-ММ-ДД).
-# От неё отсчитываются все двухнедельные события (ретро, голосование).
-SPRINT_START_DATE = "2026-04-29"
+# Дефолты для нового чата (могут быть переопределены /setteamsize и /setsprintstart).
+DEFAULT_TEAM_SIZE = 6
+DEFAULT_SPRINT_START_DATE = "2026-04-29"
 
 # Время, в которое раз в 2 недели присылается голосование за спринт
 # (всегда в пятницу второй недели спринта)
@@ -32,10 +29,6 @@ SPRINT_POLL_TIME = "12:00"
 
 # Время голосования по тестовой среде (тот же день, через минуту)
 ENV_POLL_TIME = "12:01"
-
-# ID рабочего чата для авто-голосования за спринт.
-# Можно оставить None и установить через /setchat в нужном чате.
-TARGET_CHAT_ID = None
 
 # ============================================================
 
@@ -48,11 +41,17 @@ scheduler = AsyncIOScheduler(timezone=TIMEZONE)
 
 DAYS_MAP = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
 
-config = {
-    "team_size": TEAM_SIZE,
-    "sprint_start": SPRINT_START_DATE,
-    "chat_id": TARGET_CHAT_ID,
-}
+# Настройки по чатам — каждый рабочий чат регистрируется через /setchat.
+# {chat_id: {"team_size": int, "sprint_start": "YYYY-MM-DD"}}
+chat_configs = {}
+
+
+def get_chat_config(chat_id: int) -> dict:
+    """Возвращает запись конфига чата (создаёт с дефолтами, если ещё нет)."""
+    return chat_configs.setdefault(chat_id, {
+        "team_size": DEFAULT_TEAM_SIZE,
+        "sprint_start": DEFAULT_SPRINT_START_DATE,
+    })
 
 # Хранилище голосований за спринт.
 # {poll_id: {"chat_id", "message_id", "votes": {user_id: (name, score)}, "closed"}}
@@ -142,8 +141,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Что я умею:\n"
         "1) Напоминать о встречах (дейли, ретро и др.)\n"
         "2) Раз в 2 недели присылать голосование за спринт (0–10) и считать среднее\n\n"
-        "📌 Сначала зайди в рабочий чат и выполни /setchat — тогда я начну "
-        "присылать туда голосование за спринт автоматически.\n\n"
+        "📌 В каждом рабочем чате (если у тебя их несколько — у каждой команды свой) "
+        "выполни /setchat — тогда я начну присылать туда голосование за спринт.\n"
+        "Снять чат с роли рабочего: /unsetchat (для админов).\n"
+        "Каждый чат имеет свои team_size и sprint_start.\n\n"
         "🛎 Команды напоминаний:\n"
         "/daily ЧЧ:ММ Текст — каждый будний день\n"
         "/weekly ДЕНЬ ЧЧ:ММ Текст — раз в неделю\n"
@@ -181,10 +182,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/removebirthday — удалить свой (или в reply — чужой, для админов)\n"
         "/birthdays — показать список\n"
         "/checkbirthdays — проверить и поздравить прямо сейчас (для теста)\n\n"
-        "⚙️ Настройки:\n"
-        "/settings — показать текущие настройки\n"
-        "/setteamsize N — изменить размер команды\n"
-        "/setsprintstart YYYY-MM-DD — изменить дату начала спринта\n\n"
+        "⚙️ Настройки (применяются к текущему чату):\n"
+        "/settings — показать настройки этого чата\n"
+        "/setteamsize N — размер команды\n"
+        "/setsprintstart YYYY-MM-DD — дата начала спринта\n\n"
         "Примеры:\n"
         "  /daily 10:00 Дейли-стендап\n"
         "  /weekly fri 16:00 Демо\n"
@@ -197,12 +198,40 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # /setchat
 # ============================================================
 async def setchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    config["chat_id"] = update.effective_chat.id
-    schedule_sprint_poll(context.application)
-    schedule_env_poll(context.application)
+    chat_id = update.effective_chat.id
+    is_new = chat_id not in chat_configs
+    cfg = get_chat_config(chat_id)
+    schedule_sprint_poll(context.application, chat_id)
+    schedule_env_poll(context.application, chat_id)
+    if is_new:
+        await update.message.reply_text(
+            f"✅ Этот чат добавлен в рабочие (ID: {chat_id}).\n"
+            f"Голосование за спринт и тестовую среду будет приходить раз в 2 недели.\n"
+            f"Текущие настройки: team_size={cfg['team_size']}, "
+            f"sprint_start={cfg['sprint_start']}."
+        )
+    else:
+        await update.message.reply_text(
+            f"Чат уже рабочий (ID: {chat_id}). Расписание пересчитано."
+        )
+
+
+async def unsetchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_chat_admin(update, context):
+        await update.message.reply_text("Эту команду могут использовать только админы чата.")
+        return
+    chat_id = update.effective_chat.id
+    if chat_id not in chat_configs:
+        await update.message.reply_text("Этот чат не был рабочим.")
+        return
+    del chat_configs[chat_id]
+    for job_id in (f"sprint_poll__{chat_id}", f"env_poll__{chat_id}"):
+        job = scheduler.get_job(job_id)
+        if job:
+            job.remove()
     await update.message.reply_text(
-        f"✅ Этот чат назначен рабочим (ID: {config['chat_id']}).\n"
-        f"Голосование за спринт и тестовую среду будет приходить раз в 2 недели."
+        f"🗑 Чат снят с роли рабочего (ID: {chat_id}). "
+        f"Голосования за спринт и тестовую среду больше не будут приходить автоматически."
     )
 
 
@@ -289,7 +318,7 @@ async def biweekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = " ".join(context.args[2:])
     chat_id = update.effective_chat.id
 
-    first_run = next_biweekly_run(day, hour, minute)
+    first_run = next_biweekly_run(day, hour, minute, chat_id)
     suffix = f"{day}_{hour:02d}{minute:02d}_{abs(hash(text)) % 100000}"
     job_id = make_job_id("biweekly", chat_id, suffix)
     scheduler.add_job(
@@ -305,9 +334,12 @@ async def biweekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-def next_biweekly_run(day: str, hour: int, minute: int) -> datetime:
-    """Ближайшая дата нужного дня недели начиная от sprint_start, не раньше now."""
-    sprint_start = datetime.strptime(config["sprint_start"], "%Y-%m-%d")
+def next_biweekly_run(day: str, hour: int, minute: int, chat_id: int) -> datetime:
+    """Ближайшая дата нужного дня недели начиная от sprint_start чата, не раньше now.
+    Если у чата нет конфига — используется DEFAULT_SPRINT_START_DATE."""
+    cfg = chat_configs.get(chat_id)
+    sprint_start_str = cfg["sprint_start"] if cfg else DEFAULT_SPRINT_START_DATE
+    sprint_start = datetime.strptime(sprint_start_str, "%Y-%m-%d")
     target_weekday = DAYS_MAP[day]
     delta = (target_weekday - sprint_start.weekday()) % 7
     run = sprint_start + timedelta(days=delta)
@@ -360,12 +392,17 @@ def build_poll_keyboard(poll_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def poll_team_size(poll: dict) -> int:
+    cfg = chat_configs.get(poll["chat_id"])
+    return cfg["team_size"] if cfg else DEFAULT_TEAM_SIZE
+
+
 def poll_text(poll_id: int) -> str:
     p = polls[poll_id]
     return (
         "📊 Оценка команды за спринт\n"
         "Поставь оценку от 0 до 10.\n\n"
-        f"Проголосовало: {len(p['votes'])}/{config['team_size']}"
+        f"Проголосовало: {len(p['votes'])}/{poll_team_size(p)}"
     )
 
 
@@ -416,7 +453,7 @@ async def vote_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.warning("edit_message_text failed: %s", e)
 
-    if is_new and len(poll["votes"]) >= config["team_size"]:
+    if is_new and len(poll["votes"]) >= poll_team_size(poll):
         await close_poll(context.application, poll_id)
 
 
@@ -434,7 +471,7 @@ async def close_poll(app, poll_id: int):
         lines = [f"• {name}: {score}" for name, score in votes.values()]
         text = (
             "📊 Оценка команды за спринт — итог\n"
-            f"Проголосовало: {len(votes)}/{config['team_size']}\n"
+            f"Проголосовало: {len(votes)}/{poll_team_size(poll)}\n"
             f"Средняя: {avg:.2f}\n\n" + "\n".join(lines)
         )
     try:
@@ -585,7 +622,7 @@ async def dailymembers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def send_daily_pick(app, chat_id: int):
     # В пятницу в конце спринта — следующий дейли это планирование, ведёт скрам-мастер.
-    if is_sprint_last_friday():
+    if is_sprint_last_friday(chat_id):
         sm = scrum_masters.get(chat_id)
         if sm:
             await app.bot.send_message(
@@ -705,12 +742,20 @@ def schedule_daily_pick(app):
 # Настройки
 # ============================================================
 async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    cfg = chat_configs.get(chat_id)
+    if not cfg:
+        await update.message.reply_text(
+            "Этот чат ещё не рабочий. Сделай /setchat, чтобы зарегистрировать его."
+        )
+        return
     await update.message.reply_text(
-        "⚙️ Настройки:\n"
-        f"• team_size: {config['team_size']}\n"
-        f"• sprint_start: {config['sprint_start']}\n"
-        f"• chat_id: {config['chat_id']}\n"
+        "⚙️ Настройки этого чата:\n"
+        f"• chat_id: {chat_id}\n"
+        f"• team_size: {cfg['team_size']}\n"
+        f"• sprint_start: {cfg['sprint_start']}\n"
         f"• sprint_poll_time: {SPRINT_POLL_TIME}\n"
+        f"• env_poll_time: {ENV_POLL_TIME}\n"
         f"• timezone: {TIMEZONE}"
     )
 
@@ -726,8 +771,12 @@ async def setteamsize_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("Нужно положительное число.")
         return
-    config["team_size"] = n
-    await update.message.reply_text(f"✅ team_size = {n}")
+    chat_id = update.effective_chat.id
+    if chat_id not in chat_configs:
+        await update.message.reply_text("Сначала сделай /setchat в этом чате.")
+        return
+    chat_configs[chat_id]["team_size"] = n
+    await update.message.reply_text(f"✅ team_size = {n} (для этого чата)")
 
 
 async def setsprintstart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -739,10 +788,14 @@ async def setsprintstart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except ValueError:
         await update.message.reply_text("Неверный формат даты, нужно YYYY-MM-DD")
         return
-    config["sprint_start"] = context.args[0]
-    schedule_sprint_poll(context.application)
-    schedule_env_poll(context.application)
-    await update.message.reply_text(f"✅ sprint_start = {context.args[0]}")
+    chat_id = update.effective_chat.id
+    if chat_id not in chat_configs:
+        await update.message.reply_text("Сначала сделай /setchat в этом чате.")
+        return
+    chat_configs[chat_id]["sprint_start"] = context.args[0]
+    schedule_sprint_poll(context.application, chat_id)
+    schedule_env_poll(context.application, chat_id)
+    await update.message.reply_text(f"✅ sprint_start = {context.args[0]} (для этого чата)")
 
 
 # ============================================================
@@ -1198,9 +1251,12 @@ async def closeenvpoll_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 # Расписание авто-голосования
 # ============================================================
-def is_sprint_last_friday() -> bool:
-    """Сегодня — пятница второй недели текущего спринта (день 7..13, weekday=fri)."""
-    sprint_start = datetime.strptime(config["sprint_start"], "%Y-%m-%d").date()
+def is_sprint_last_friday(chat_id: int) -> bool:
+    """Сегодня — пятница второй недели текущего спринта данного чата."""
+    cfg = chat_configs.get(chat_id)
+    if not cfg:
+        return False
+    sprint_start = datetime.strptime(cfg["sprint_start"], "%Y-%m-%d").date()
     today = now_tz().date()
     delta = (today - sprint_start).days
     if delta < 0:
@@ -1209,10 +1265,11 @@ def is_sprint_last_friday() -> bool:
     return day_in_cycle in range(7, 14) and today.weekday() == DAYS_MAP["fri"]
 
 
-def next_second_week_friday(time_str: str) -> datetime:
-    """Ближайшая пятница второй недели спринта в указанное время МСК."""
+def next_second_week_friday(time_str: str, chat_id: int) -> datetime:
+    """Ближайшая пятница второй недели спринта (для конкретного чата) в указанное время МСК."""
+    cfg = chat_configs[chat_id]
     h, m = parse_time(time_str)
-    sprint_start = datetime.strptime(config["sprint_start"], "%Y-%m-%d")
+    sprint_start = datetime.strptime(cfg["sprint_start"], "%Y-%m-%d")
     second_week_start = sprint_start + timedelta(days=7)
     days_until_friday = (DAYS_MAP["fri"] - second_week_start.weekday()) % 7
     run = second_week_start + timedelta(days=days_until_friday)
@@ -1222,11 +1279,10 @@ def next_second_week_friday(time_str: str) -> datetime:
     return run
 
 
-def schedule_sprint_poll(app):
-    chat_id = config["chat_id"]
-    if not chat_id:
+def schedule_sprint_poll(app, chat_id: int):
+    if chat_id not in chat_configs:
         return
-    first_run = next_second_week_friday(SPRINT_POLL_TIME)
+    first_run = next_second_week_friday(SPRINT_POLL_TIME, chat_id)
     job_id = f"sprint_poll__{chat_id}"
     scheduler.add_job(
         send_sprint_poll,
@@ -1235,14 +1291,13 @@ def schedule_sprint_poll(app):
         id=job_id,
         replace_existing=True,
     )
-    log.info("Sprint poll scheduled, first run at %s", first_run)
+    log.info("Sprint poll scheduled for chat %s, first run at %s", chat_id, first_run)
 
 
-def schedule_env_poll(app):
-    chat_id = config["chat_id"]
-    if not chat_id:
+def schedule_env_poll(app, chat_id: int):
+    if chat_id not in chat_configs:
         return
-    first_run = next_second_week_friday(ENV_POLL_TIME)
+    first_run = next_second_week_friday(ENV_POLL_TIME, chat_id)
     job_id = f"env_poll__{chat_id}"
     scheduler.add_job(
         send_env_poll,
@@ -1251,7 +1306,7 @@ def schedule_env_poll(app):
         id=job_id,
         replace_existing=True,
     )
-    log.info("Env poll scheduled, first run at %s", first_run)
+    log.info("Env poll scheduled for chat %s, first run at %s", chat_id, first_run)
 
 
 # ============================================================
@@ -1266,9 +1321,9 @@ async def send_message(app, chat_id, text):
 # ============================================================
 async def post_init(app):
     scheduler.start()
-    if config["chat_id"]:
-        schedule_sprint_poll(app)
-        schedule_env_poll(app)
+    for chat_id in list(chat_configs.keys()):
+        schedule_sprint_poll(app, chat_id)
+        schedule_env_poll(app, chat_id)
     schedule_daily_pick(app)
     schedule_birthday_check(app)
     log.info("Scheduler started")
@@ -1279,6 +1334,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("setchat", setchat))
+    app.add_handler(CommandHandler("unsetchat", unsetchat))
 
     app.add_handler(CommandHandler("daily", daily_cmd))
     app.add_handler(CommandHandler("weekly", weekly_cmd))
