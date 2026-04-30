@@ -85,6 +85,28 @@ def now_tz() -> datetime:
     return datetime.now(ZoneInfo(TIMEZONE))
 
 
+async def is_chat_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """True, если команду вызвал админ или создатель чата (в личке — всегда True)."""
+    chat = update.effective_chat
+    user = update.effective_user
+    if chat.type == "private":
+        return True
+    try:
+        member = await context.bot.get_chat_member(chat.id, user.id)
+        return member.status in ("administrator", "creator")
+    except Exception as e:
+        log.warning("get_chat_member failed: %s", e)
+        return False
+
+
+def reply_target_user(update: Update):
+    """Возвращает telegram.User, на чьё сообщение сделан reply, или None."""
+    msg = update.message
+    if not msg or not msg.reply_to_message:
+        return None
+    return msg.reply_to_message.from_user
+
+
 # ============================================================
 # /start
 # ============================================================
@@ -109,12 +131,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🧪 Оценка тестовой среды (пт 12:01 МСК, раз в 2 недели, голосуют тестировщики, считается среднее):\n"
         "/registertester — добавить себя в список тестировщиков\n"
         "/unregistertester — убрать себя из списка\n"
+        "/addtester (reply, для админов) — добавить того, на чьё сообщение отвечаешь\n"
+        "/removetester (reply, для админов) — удалить того, на чьё сообщение отвечаешь\n"
         "/testers — показать список тестировщиков\n"
         "/startenvpoll — запустить голосование по тестовой среде вручную\n"
         "/closeenvpoll — досрочно закрыть голосование и показать среднее\n\n"
         "🎲 Случайный фасилитатор дейли (каждый будний день в 11:59 МСК):\n"
         "/joindaily — добавить себя в список фасилитаторов\n"
         "/leavedaily — убрать себя из списка\n"
+        "/addfacilitator (reply, для админов) — добавить того, на чьё сообщение отвечаешь\n"
+        "/removefacilitator (reply, для админов) — удалить того, на чьё сообщение отвечаешь\n"
         "/dailymembers — показать список\n"
         "/picknow — выбрать фасилитатора прямо сейчас (для теста)\n\n"
         "⚙️ Настройки:\n"
@@ -437,6 +463,61 @@ async def joindaily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def addfacilitator_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_chat_admin(update, context):
+        await update.message.reply_text("Эту команду могут использовать только админы чата.")
+        return
+    target = reply_target_user(update)
+    if not target:
+        await update.message.reply_text(
+            "Используй reply: ответь этой командой на сообщение того, кого хочешь добавить."
+        )
+        return
+    if target.is_bot:
+        await update.message.reply_text("Бота добавить в фасилитаторы нельзя.")
+        return
+    chat_id = update.effective_chat.id
+    members = team_members.setdefault(chat_id, [])
+    for m in members:
+        if m["user_id"] == target.id:
+            m["username"] = target.username
+            m["full_name"] = target.full_name
+            await update.message.reply_text(
+                f"{target.full_name} уже в списке фасилитаторов (профиль обновлён)."
+            )
+            return
+    members.append({
+        "user_id": target.id,
+        "username": target.username,
+        "full_name": target.full_name,
+    })
+    await update.message.reply_text(
+        f"✅ {target.full_name} добавлен в список фасилитаторов. Сейчас в списке: {len(members)}."
+    )
+
+
+async def removefacilitator_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_chat_admin(update, context):
+        await update.message.reply_text("Эту команду могут использовать только админы чата.")
+        return
+    target = reply_target_user(update)
+    if not target:
+        await update.message.reply_text(
+            "Используй reply: ответь этой командой на сообщение того, кого хочешь удалить."
+        )
+        return
+    chat_id = update.effective_chat.id
+    members = team_members.get(chat_id, [])
+    new_members = [m for m in members if m["user_id"] != target.id]
+    if len(new_members) == len(members):
+        await update.message.reply_text(f"{target.full_name} не было в списке фасилитаторов.")
+        return
+    team_members[chat_id] = new_members
+    await update.message.reply_text(
+        f"🗑 {target.full_name} удалён из списка фасилитаторов."
+    )
+
+
 async def leavedaily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user = update.effective_user
@@ -632,6 +713,61 @@ async def registertester_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(
         f"✅ {user.full_name} добавлен в список тестировщиков. "
         f"Сейчас в списке: {len(chat_testers)}."
+    )
+
+
+async def addtester_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_chat_admin(update, context):
+        await update.message.reply_text("Эту команду могут использовать только админы чата.")
+        return
+    target = reply_target_user(update)
+    if not target:
+        await update.message.reply_text(
+            "Используй reply: ответь этой командой на сообщение того, кого хочешь добавить."
+        )
+        return
+    if target.is_bot:
+        await update.message.reply_text("Бота добавить в тестировщики нельзя.")
+        return
+    chat_id = update.effective_chat.id
+    chat_testers = testers.setdefault(chat_id, [])
+    for t in chat_testers:
+        if t["user_id"] == target.id:
+            t["username"] = target.username
+            t["full_name"] = target.full_name
+            await update.message.reply_text(
+                f"{target.full_name} уже в списке тестировщиков (профиль обновлён)."
+            )
+            return
+    chat_testers.append({
+        "user_id": target.id,
+        "username": target.username,
+        "full_name": target.full_name,
+    })
+    await update.message.reply_text(
+        f"✅ {target.full_name} добавлен в список тестировщиков. Сейчас в списке: {len(chat_testers)}."
+    )
+
+
+async def removetester_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_chat_admin(update, context):
+        await update.message.reply_text("Эту команду могут использовать только админы чата.")
+        return
+    target = reply_target_user(update)
+    if not target:
+        await update.message.reply_text(
+            "Используй reply: ответь этой командой на сообщение того, кого хочешь удалить."
+        )
+        return
+    chat_id = update.effective_chat.id
+    chat_testers = testers.get(chat_id, [])
+    new_list = [t for t in chat_testers if t["user_id"] != target.id]
+    if len(new_list) == len(chat_testers):
+        await update.message.reply_text(f"{target.full_name} не было в списке тестировщиков.")
+        return
+    testers[chat_id] = new_list
+    await update.message.reply_text(
+        f"🗑 {target.full_name} удалён из списка тестировщиков."
     )
 
 
@@ -861,6 +997,8 @@ def main():
     app.add_handler(CommandHandler("leavedaily", leavedaily_cmd))
     app.add_handler(CommandHandler("dailymembers", dailymembers_cmd))
     app.add_handler(CommandHandler("picknow", picknow_cmd))
+    app.add_handler(CommandHandler("addfacilitator", addfacilitator_cmd))
+    app.add_handler(CommandHandler("removefacilitator", removefacilitator_cmd))
 
     app.add_handler(CommandHandler("registertester", registertester_cmd))
     app.add_handler(CommandHandler("unregistertester", unregistertester_cmd))
@@ -868,6 +1006,8 @@ def main():
     app.add_handler(CommandHandler("testers", tester_cmd))
     app.add_handler(CommandHandler("startenvpoll", startenvpoll_cmd))
     app.add_handler(CommandHandler("closeenvpoll", closeenvpoll_cmd))
+    app.add_handler(CommandHandler("addtester", addtester_cmd))
+    app.add_handler(CommandHandler("removetester", removetester_cmd))
 
     app.add_handler(CommandHandler("settings", settings_cmd))
     app.add_handler(CommandHandler("setteamsize", setteamsize_cmd))
