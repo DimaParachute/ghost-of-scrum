@@ -75,6 +75,10 @@ testers = {}
 # {(chat_id, message_id): {"votes": {user_id: (name, score)}, "closed": bool}}
 env_polls = {}
 
+# Скрам-мастер по чатам (один на чат).
+# {chat_id: {"user_id", "username", "full_name"}}
+scrum_masters = {}
+
 
 def parse_time(s: str):
     h, m = s.split(":")
@@ -143,6 +147,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/removefacilitator (reply, для админов) — удалить того, на чьё сообщение отвечаешь\n"
         "/dailymembers — показать список\n"
         "/picknow — выбрать фасилитатора прямо сейчас (для теста)\n\n"
+        "🧭 Скрам-мастер (один на команду, ведёт планирование в пн):\n"
+        "В пятницу в конце спринта вместо случайного фасилитатора тегается скрам-мастер.\n"
+        "/registerscrum — зарегистрироваться скрам-мастером\n"
+        "/unregisterscrum — снять регистрацию\n"
+        "/scrum — показать зарегистрированного скрам-мастера\n"
+        "/setscrum (reply, для админов) — назначить того, на чьё сообщение отвечаешь\n"
+        "/unsetscrum (для админов) — снять текущего скрам-мастера\n\n"
         "⚙️ Настройки:\n"
         "/settings — показать текущие настройки\n"
         "/setteamsize N — изменить размер команды\n"
@@ -546,6 +557,21 @@ async def dailymembers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def send_daily_pick(app, chat_id: int):
+    # В пятницу в конце спринта — следующий дейли это планирование, ведёт скрам-мастер.
+    if is_sprint_last_friday():
+        sm = scrum_masters.get(chat_id)
+        if sm:
+            await app.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"🧭 Следующий дейли — планирование нового спринта.\n"
+                    f"Ведёт скрам-мастер: {member_mention(sm)}"
+                ),
+                parse_mode="HTML",
+            )
+            return
+        log.info("Sprint last friday in chat %s, but no scrum-master — falling back to random pick", chat_id)
+
     members = team_members.get(chat_id, [])
     if not members:
         log.info("Skipping daily pick for chat %s — no members", chat_id)
@@ -690,6 +716,99 @@ async def setsprintstart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     schedule_sprint_poll(context.application)
     schedule_env_poll(context.application)
     await update.message.reply_text(f"✅ sprint_start = {context.args[0]}")
+
+
+# ============================================================
+# Скрам-мастер (один на чат, ведёт планирование в пн)
+# ============================================================
+async def registerscrum_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+    prev = scrum_masters.get(chat_id)
+    scrum_masters[chat_id] = {
+        "user_id": user.id,
+        "username": user.username,
+        "full_name": user.full_name,
+    }
+    if prev and prev["user_id"] != user.id:
+        await update.message.reply_text(
+            f"✅ Скрам-мастер заменён: {prev['full_name']} → {user.full_name}."
+        )
+    else:
+        await update.message.reply_text(
+            f"✅ {user.full_name} зарегистрирован как скрам-мастер. "
+            f"Будет тегаться в пятницу в конце спринта на следующее планирование."
+        )
+
+
+async def unregisterscrum_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+    sm = scrum_masters.get(chat_id)
+    if not sm:
+        await update.message.reply_text("В этом чате нет зарегистрированного скрам-мастера.")
+        return
+    if sm["user_id"] != user.id:
+        await update.message.reply_text("Снять регистрацию может только сам скрам-мастер.")
+        return
+    del scrum_masters[chat_id]
+    await update.message.reply_text("🗑 Скрам-мастер снят с регистрации.")
+
+
+async def scrum_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    sm = scrum_masters.get(chat_id)
+    if not sm:
+        await update.message.reply_text(
+            "Скрам-мастер не зарегистрирован. Пусть напишет /registerscrum, "
+            "или админ назначит командой /setscrum в reply."
+        )
+        return
+    suffix = f" (@{sm['username']})" if sm.get("username") else ""
+    await update.message.reply_text(f"🧭 Скрам-мастер: {sm['full_name']}{suffix}")
+
+
+async def setscrum_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_chat_admin(update, context):
+        await update.message.reply_text("Эту команду могут использовать только админы чата.")
+        return
+    target = reply_target_user(update)
+    if not target:
+        await update.message.reply_text(
+            "Используй reply: ответь этой командой на сообщение того, кого хочешь назначить скрам-мастером."
+        )
+        return
+    if target.is_bot:
+        await update.message.reply_text("Бота скрам-мастером сделать нельзя.")
+        return
+    chat_id = update.effective_chat.id
+    prev = scrum_masters.get(chat_id)
+    scrum_masters[chat_id] = {
+        "user_id": target.id,
+        "username": target.username,
+        "full_name": target.full_name,
+    }
+    if prev and prev["user_id"] != target.id:
+        await update.message.reply_text(
+            f"✅ Скрам-мастер заменён: {prev['full_name']} → {target.full_name}."
+        )
+    else:
+        await update.message.reply_text(
+            f"✅ {target.full_name} назначен скрам-мастером."
+        )
+
+
+async def unsetscrum_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_chat_admin(update, context):
+        await update.message.reply_text("Эту команду могут использовать только админы чата.")
+        return
+    chat_id = update.effective_chat.id
+    sm = scrum_masters.get(chat_id)
+    if not sm:
+        await update.message.reply_text("В этом чате нет зарегистрированного скрам-мастера.")
+        return
+    del scrum_masters[chat_id]
+    await update.message.reply_text(f"🗑 {sm['full_name']} снят с роли скрам-мастера.")
 
 
 # ============================================================
@@ -914,6 +1033,17 @@ async def closeenvpoll_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 # Расписание авто-голосования
 # ============================================================
+def is_sprint_last_friday() -> bool:
+    """Сегодня — пятница второй недели текущего спринта (день 7..13, weekday=fri)."""
+    sprint_start = datetime.strptime(config["sprint_start"], "%Y-%m-%d").date()
+    today = now_tz().date()
+    delta = (today - sprint_start).days
+    if delta < 0:
+        return False
+    day_in_cycle = delta % 14
+    return day_in_cycle in range(7, 14) and today.weekday() == DAYS_MAP["fri"]
+
+
 def next_second_week_friday(time_str: str) -> datetime:
     """Ближайшая пятница второй недели спринта в указанное время МСК."""
     h, m = parse_time(time_str)
@@ -1008,6 +1138,13 @@ def main():
     app.add_handler(CommandHandler("closeenvpoll", closeenvpoll_cmd))
     app.add_handler(CommandHandler("addtester", addtester_cmd))
     app.add_handler(CommandHandler("removetester", removetester_cmd))
+
+    app.add_handler(CommandHandler("registerscrum", registerscrum_cmd))
+    app.add_handler(CommandHandler("unregisterscrum", unregisterscrum_cmd))
+    app.add_handler(CommandHandler("scrum", scrum_cmd))
+    app.add_handler(CommandHandler("scrummaster", scrum_cmd))
+    app.add_handler(CommandHandler("setscrum", setscrum_cmd))
+    app.add_handler(CommandHandler("unsetscrum", unsetscrum_cmd))
 
     app.add_handler(CommandHandler("settings", settings_cmd))
     app.add_handler(CommandHandler("setteamsize", setteamsize_cmd))
