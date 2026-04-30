@@ -79,6 +79,10 @@ env_polls = {}
 # {chat_id: {"user_id", "username", "full_name"}}
 scrum_masters = {}
 
+# Дни рождения по чатам.
+# {chat_id: {user_id: {"username", "full_name", "month", "day"}}}
+birthdays = {}
+
 
 def parse_time(s: str):
     h, m = s.split(":")
@@ -109,6 +113,24 @@ def reply_target_user(update: Update):
     if not msg or not msg.reply_to_message:
         return None
     return msg.reply_to_message.from_user
+
+
+def parse_birthday(s: str):
+    """Принимает ДД.ММ / ДД-ММ / ДД/ММ. Возвращает (month, day)."""
+    s = s.strip().replace("-", ".").replace("/", ".")
+    parts = s.split(".")
+    if len(parts) != 2:
+        raise ValueError("expected DD.MM")
+    day = int(parts[0])
+    month = int(parts[1])
+    if not (1 <= month <= 12):
+        raise ValueError("month out of range")
+    # Допускаем 29.02 (год не известен, в невисокосный поздравим 28.02).
+    from calendar import monthrange
+    max_day = 29 if month == 2 else monthrange(2024, month)[1]
+    if not (1 <= day <= max_day):
+        raise ValueError("day out of range")
+    return month, day
 
 
 # ============================================================
@@ -154,6 +176,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/scrum — показать зарегистрированного скрам-мастера\n"
         "/setscrum (reply, для админов) — назначить того, на чьё сообщение отвечаешь\n"
         "/unsetscrum (для админов) — снять текущего скрам-мастера\n\n"
+        "🎂 Дни рождения (поздравление в чат в 09:00 МСК):\n"
+        "/setbirthday ДД.ММ — поставить себе (или в reply на сообщение — поставить другому, для админов)\n"
+        "/removebirthday — удалить свой (или в reply — чужой, для админов)\n"
+        "/birthdays — показать список\n"
+        "/checkbirthdays — проверить и поздравить прямо сейчас (для теста)\n\n"
         "⚙️ Настройки:\n"
         "/settings — показать текущие настройки\n"
         "/setteamsize N — изменить размер команды\n"
@@ -812,6 +839,144 @@ async def unsetscrum_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
+# Дни рождения
+# ============================================================
+async def setbirthday_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "Формат: /setbirthday ДД.ММ\nПример: /setbirthday 15.07\n"
+            "Чтобы поставить кому-то — ответь этой командой на его сообщение (только админы)."
+        )
+        return
+    try:
+        month, day = parse_birthday(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Неверная дата. Нужно ДД.ММ, например 15.07.")
+        return
+
+    chat_id = update.effective_chat.id
+    target = reply_target_user(update)
+
+    if target:
+        if not await is_chat_admin(update, context):
+            await update.message.reply_text(
+                "Назначать день рождения другим могут только админы чата."
+            )
+            return
+        if target.is_bot:
+            await update.message.reply_text("Боту день рождения не положен.")
+            return
+        user_id = target.id
+        username = target.username
+        full_name = target.full_name
+    else:
+        user = update.effective_user
+        user_id = user.id
+        username = user.username
+        full_name = user.full_name
+
+    birthdays.setdefault(chat_id, {})[user_id] = {
+        "username": username,
+        "full_name": full_name,
+        "month": month,
+        "day": day,
+    }
+    await update.message.reply_text(
+        f"🎂 День рождения {full_name} сохранён: {day:02d}.{month:02d}."
+    )
+
+
+async def removebirthday_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    target = reply_target_user(update)
+
+    if target:
+        if not await is_chat_admin(update, context):
+            await update.message.reply_text(
+                "Удалять день рождения у других могут только админы чата."
+            )
+            return
+        user_id = target.id
+        full_name = target.full_name
+    else:
+        user_id = update.effective_user.id
+        full_name = update.effective_user.full_name
+
+    chat_bdays = birthdays.get(chat_id, {})
+    if user_id not in chat_bdays:
+        await update.message.reply_text(f"У {full_name} нет сохранённого дня рождения.")
+        return
+    del chat_bdays[user_id]
+    await update.message.reply_text(f"🗑 День рождения {full_name} удалён.")
+
+
+async def birthdays_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    chat_bdays = birthdays.get(chat_id, {})
+    if not chat_bdays:
+        await update.message.reply_text(
+            "Список дней рождения пуст. Добавить свой — /setbirthday ДД.ММ."
+        )
+        return
+    items = sorted(chat_bdays.values(), key=lambda b: (b["month"], b["day"]))
+    lines = ["🎂 Дни рождения:"]
+    for b in items:
+        suffix = f" (@{b['username']})" if b.get("username") else ""
+        lines.append(f"• {b['day']:02d}.{b['month']:02d} — {b['full_name']}{suffix}")
+    await update.message.reply_text("\n".join(lines))
+
+
+def is_birthday_today(b: dict) -> bool:
+    today = now_tz().date()
+    if b["month"] == today.month and b["day"] == today.day:
+        return True
+    # 29.02 в невисокосный год — поздравляем 28.02
+    if b["month"] == 2 and b["day"] == 29 and today.month == 2 and today.day == 28:
+        from calendar import isleap
+        if not isleap(today.year):
+            return True
+    return False
+
+
+async def send_birthday_greetings_to_all(app):
+    for chat_id, chat_bdays in list(birthdays.items()):
+        for user_id, b in list(chat_bdays.items()):
+            if not is_birthday_today(b):
+                continue
+            mention = member_mention({
+                "user_id": user_id,
+                "username": b.get("username"),
+                "full_name": b["full_name"],
+            })
+            try:
+                await app.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"🎉 Сегодня день рождения у {mention}!\n🎂 С днём рождения! 🎈",
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                log.warning("birthday greeting failed in chat %s: %s", chat_id, e)
+
+
+async def checkbirthdays_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_birthday_greetings_to_all(context.application)
+    await update.message.reply_text(
+        "Проверил. Если у кого-то сегодня день рождения — поздравил."
+    )
+
+
+def schedule_birthday_check(app):
+    scheduler.add_job(
+        send_birthday_greetings_to_all,
+        trigger=CronTrigger(hour=9, minute=0, timezone=TIMEZONE),
+        args=[app],
+        id="birthday_check",
+        replace_existing=True,
+    )
+    log.info("Daily birthday check scheduled at 09:00 %s", TIMEZONE)
+
+
+# ============================================================
 # Голосование по тестовой среде (тестировщики, 0–5, среднее)
 # ============================================================
 async def registertester_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1105,6 +1270,7 @@ async def post_init(app):
         schedule_sprint_poll(app)
         schedule_env_poll(app)
     schedule_daily_pick(app)
+    schedule_birthday_check(app)
     log.info("Scheduler started")
 
 
@@ -1145,6 +1311,11 @@ def main():
     app.add_handler(CommandHandler("scrummaster", scrum_cmd))
     app.add_handler(CommandHandler("setscrum", setscrum_cmd))
     app.add_handler(CommandHandler("unsetscrum", unsetscrum_cmd))
+
+    app.add_handler(CommandHandler("setbirthday", setbirthday_cmd))
+    app.add_handler(CommandHandler("removebirthday", removebirthday_cmd))
+    app.add_handler(CommandHandler("birthdays", birthdays_cmd))
+    app.add_handler(CommandHandler("checkbirthdays", checkbirthdays_cmd))
 
     app.add_handler(CommandHandler("settings", settings_cmd))
     app.add_handler(CommandHandler("setteamsize", setteamsize_cmd))
