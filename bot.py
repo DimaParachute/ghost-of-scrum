@@ -148,6 +148,7 @@ def save_state():
     try:
         data = _serialize_state()
         directory = os.path.dirname(os.path.abspath(STATE_PATH)) or "."
+        os.makedirs(directory, exist_ok=True)
         fd, tmp_path = tempfile.mkstemp(prefix=".state.", suffix=".tmp", dir=directory)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
