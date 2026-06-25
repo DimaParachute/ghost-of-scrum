@@ -40,6 +40,15 @@ DEFAULT_TEAM_SIZE = 6
 DEFAULT_SPRINT_START_DATE = "2026-04-29"
 DEFAULT_FACILITATORS_ENABLED = True
 
+# Время выбора случайного фасилитатора дейли. Настраивается /setdailytime.
+DEFAULT_DAILY_PICK_TIME = "11:15"
+
+# Периодичность выбора фасилитатора: "daily" (каждый будний день),
+# "weekly" (раз в неделю) или "biweekly" (раз в 2 недели от sprint_start).
+# Для weekly/biweekly используется день недели daily_pick_day. Настраивается /setdailyfreq.
+DEFAULT_DAILY_PICK_FREQ = "daily"
+DEFAULT_DAILY_PICK_DAY = "mon"
+
 # Время, в которое раз в 2 недели присылается голосование за спринт
 # (всегда в пятницу второй недели спринта)
 SPRINT_POLL_TIME = "12:00"
@@ -73,6 +82,9 @@ def get_chat_config(chat_id: int) -> dict:
         "team_size": DEFAULT_TEAM_SIZE,
         "sprint_start": DEFAULT_SPRINT_START_DATE,
         "facilitators_enabled": DEFAULT_FACILITATORS_ENABLED,
+        "daily_pick_time": DEFAULT_DAILY_PICK_TIME,
+        "daily_pick_freq": DEFAULT_DAILY_PICK_FREQ,
+        "daily_pick_day": DEFAULT_DAILY_PICK_DAY,
     })
 
 # Хранилище голосований за спринт.
@@ -87,6 +99,10 @@ team_members = {}
 # Активные сообщения с выбором фасилитатора.
 # {(chat_id, message_id): {"current": user_id, "declined": set(user_id), "confirmed": bool}}
 daily_picks = {}
+
+# Последний выбранный рандомайзером фасилитатор по чатам (для напоминаний с тегом).
+# {chat_id: {"user_id", "username", "full_name"}}
+last_facilitators = {}
 
 # Тестировщики по чатам (можно несколько).
 # {chat_id: [{"user_id", "username", "full_name"}, ...]}
@@ -156,6 +172,7 @@ def _serialize_state() -> dict:
             for (cid, mid), p in daily_picks.items()
         ],
         "user_reminders": list(user_reminders.values()),
+        "last_facilitators": {str(cid): m for cid, m in last_facilitators.items()},
     }
 
 
@@ -229,6 +246,9 @@ def load_state():
             "facilitators_enabled": cfg.get(
                 "facilitators_enabled", DEFAULT_FACILITATORS_ENABLED
             ),
+            "daily_pick_time": cfg.get("daily_pick_time", DEFAULT_DAILY_PICK_TIME),
+            "daily_pick_freq": cfg.get("daily_pick_freq", DEFAULT_DAILY_PICK_FREQ),
+            "daily_pick_day": cfg.get("daily_pick_day", DEFAULT_DAILY_PICK_DAY),
         }
 
     team_members.clear()
@@ -279,6 +299,10 @@ def load_state():
     for r in data.get("user_reminders", []):
         user_reminders[r["job_id"]] = r
 
+    last_facilitators.clear()
+    for cid, m in data.get("last_facilitators", {}).items():
+        last_facilitators[int(cid)] = m
+
     log.info(
         "State loaded: %d chats, %d polls, %d env polls, %d daily picks, %d user reminders",
         len(chat_configs), len(polls), len(env_polls), len(daily_picks), len(user_reminders),
@@ -289,6 +313,18 @@ def restore_user_reminders(app):
     """Воссоздаёт пользовательские напоминания (/daily, /weekly, /biweekly) из user_reminders."""
     for r in user_reminders.values():
         try:
+            if r["type"] == "dailyfacilitator":
+                scheduler.add_job(
+                    send_daily_facilitator_reminder,
+                    trigger=CronTrigger(
+                        day_of_week="mon-fri",
+                        hour=r["hour"], minute=r["minute"], timezone=TIMEZONE,
+                    ),
+                    args=[app, r["chat_id"], r["text"]],
+                    id=r["job_id"],
+                    replace_existing=True,
+                )
+                continue
             if r["type"] == "daily":
                 trigger = CronTrigger(
                     day_of_week="mon-fri",
@@ -396,13 +432,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/testers — показать список тестировщиков\n"
         "/startenvpoll — запустить голосование по тестовой среде вручную\n"
         "/closeenvpoll — досрочно закрыть голосование и показать среднее\n\n"
-        "🎲 Случайный фасилитатор дейли (каждый будний день в 11:59 МСК):\n"
+        "🎲 Случайный фасилитатор дейли (по умолчанию каждый будний день; время — /setdailytime, периодичность — /setdailyfreq):\n"
         "/joindaily — добавить себя в список фасилитаторов\n"
         "/leavedaily — убрать себя из списка\n"
         "/addfacilitator (reply, для админов) — добавить того, на чьё сообщение отвечаешь\n"
         "/removefacilitator (reply, для админов) — удалить того, на чьё сообщение отвечаешь\n"
         "/dailymembers — показать список\n"
         "/picknow — выбрать фасилитатора прямо сейчас (для теста)\n"
+        "/setdailytime ЧЧ:ММ — время выбора фасилитатора (для админов)\n"
+        "/setdailyfreq daily|weekly ДЕНЬ|biweekly ДЕНЬ — как часто выбирать фасилитатора (для админов)\n"
+        "/dailyreminder ЧЧ:ММ Текст — напоминание о дейли с тегом текущего ведущего (пн–пт)\n"
         "/disablefacilitators — отключить выбор фасилитатора; дейли ведёт скрам-мастер\n"
         "/enablefacilitators — вернуть выбор фасилитатора как сейчас\n"
         "Если список фасилитаторов пуст — дейли ведёт скрам-мастер.\n\n"
@@ -445,6 +484,7 @@ async def setchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cfg = get_chat_config(chat_id)
     schedule_sprint_poll(context.application, chat_id)
     schedule_env_poll(context.application, chat_id)
+    schedule_daily_pick(context.application, chat_id)
     save_state()
     if is_new:
         await update.message.reply_text(
@@ -468,7 +508,7 @@ async def unsetchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Этот чат не был рабочим.")
         return
     del chat_configs[chat_id]
-    for job_id in (f"sprint_poll__{chat_id}", f"env_poll__{chat_id}"):
+    for job_id in (f"sprint_poll__{chat_id}", f"env_poll__{chat_id}", f"daily_pick__{chat_id}"):
         job = scheduler.get_job(job_id)
         if job:
             job.remove()
@@ -944,6 +984,7 @@ async def send_daily_pick(app, chat_id: int):
         return
 
     chosen = random.choice(available_members)
+    last_facilitators[chat_id] = chosen
     text = (
         f"🎲 Следующий дейли проводит: {member_mention(chosen)}\n\n"
         f"Сможешь? Нажми кнопку ниже."
@@ -1026,6 +1067,7 @@ async def daily_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
         new_chosen = random.choice(candidates)
         pick["current"] = new_chosen["user_id"]
+        last_facilitators[chat_id] = new_chosen
         save_state()
         await query.edit_message_text(
             text=(
@@ -1086,25 +1128,175 @@ async def enablefacilitators_cmd(update: Update, context: ContextTypes.DEFAULT_T
     )
 
 
-async def send_daily_pick_to_all(app):
-    chat_ids = set(team_members.keys())
-    chat_ids.update(chat_configs.keys())
-    for chat_id in sorted(chat_ids):
-        try:
-            await send_daily_pick(app, chat_id)
-        except Exception as e:
-            log.warning("daily pick send failed for chat %s: %s", chat_id, e)
+def schedule_daily_pick(app, chat_id: int):
+    if chat_id not in chat_configs:
+        return
+    cfg = chat_configs[chat_id]
+    hour, minute = parse_time(cfg.get("daily_pick_time", DEFAULT_DAILY_PICK_TIME))
+    freq = cfg.get("daily_pick_freq", DEFAULT_DAILY_PICK_FREQ)
+    day = cfg.get("daily_pick_day", DEFAULT_DAILY_PICK_DAY)
+    job_id = f"daily_pick__{chat_id}"
 
+    if freq == "weekly":
+        trigger = CronTrigger(
+            day_of_week=day, hour=hour, minute=minute, timezone=TIMEZONE
+        )
+        when = f"{day} {hour:02d}:{minute:02d} (раз в неделю)"
+    elif freq == "biweekly":
+        first_run = next_biweekly_run(day, hour, minute, chat_id)
+        trigger = IntervalTrigger(weeks=2, start_date=first_run)
+        when = (
+            f"{day} {hour:02d}:{minute:02d} "
+            f"(раз в 2 недели, первый запуск {first_run:%Y-%m-%d})"
+        )
+    else:  # daily — каждый будний день
+        trigger = CronTrigger(
+            day_of_week="mon-fri", hour=hour, minute=minute, timezone=TIMEZONE
+        )
+        when = f"mon-fri {hour:02d}:{minute:02d}"
 
-def schedule_daily_pick(app):
     scheduler.add_job(
-        send_daily_pick_to_all,
-        trigger=CronTrigger(day_of_week="mon-fri", hour=11, minute=59, timezone=TIMEZONE),
-        args=[app],
-        id="daily_pick",
+        send_daily_pick,
+        trigger=trigger,
+        args=[app, chat_id],
+        id=job_id,
         replace_existing=True,
     )
-    log.info("Daily facilitator pick scheduled (mon-fri 11:59 %s)", TIMEZONE)
+    log.info(
+        "Daily facilitator pick scheduled for chat %s (%s, %s)",
+        chat_id, when, TIMEZONE,
+    )
+
+
+async def setdailytime_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_chat_admin(update, context):
+        await update.message.reply_text("Эту команду могут использовать только админы чата.")
+        return
+    if not context.args:
+        await update.message.reply_text("Формат: /setdailytime ЧЧ:ММ (например 11:59)")
+        return
+    try:
+        hour, minute = parse_time(context.args[0])
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError
+    except (ValueError, IndexError):
+        await update.message.reply_text("Неверный формат времени, нужно ЧЧ:ММ (например 11:59).")
+        return
+    chat_id = update.effective_chat.id
+    if chat_id not in chat_configs:
+        await update.message.reply_text("Сначала сделай /setchat в этом чате.")
+        return
+    chat_configs[chat_id]["daily_pick_time"] = f"{hour:02d}:{minute:02d}"
+    schedule_daily_pick(context.application, chat_id)
+    save_state()
+    await update.message.reply_text(
+        f"✅ Время выбора фасилитатора дейли = {hour:02d}:{minute:02d} (для этого чата)"
+    )
+
+
+async def setdailyfreq_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_chat_admin(update, context):
+        await update.message.reply_text("Эту команду могут использовать только админы чата.")
+        return
+    usage = (
+        "Формат: /setdailyfreq daily | weekly ДЕНЬ | biweekly ДЕНЬ\n"
+        "ДЕНЬ: mon,tue,wed,thu,fri,sat,sun\n"
+        "Примеры:\n"
+        "  /setdailyfreq daily — каждый будний день\n"
+        "  /setdailyfreq weekly mon — раз в неделю по понедельникам\n"
+        "  /setdailyfreq biweekly mon — раз в 2 недели (отсчёт от sprint_start)"
+    )
+    if not context.args:
+        await update.message.reply_text(usage)
+        return
+    freq = context.args[0].lower()
+    if freq not in ("daily", "weekly", "biweekly"):
+        await update.message.reply_text(usage)
+        return
+
+    chat_id = update.effective_chat.id
+    if chat_id not in chat_configs:
+        await update.message.reply_text("Сначала сделай /setchat в этом чате.")
+        return
+
+    if freq == "daily":
+        chat_configs[chat_id]["daily_pick_freq"] = "daily"
+        schedule_daily_pick(context.application, chat_id)
+        save_state()
+        await update.message.reply_text(
+            "✅ Фасилитатор будет выбираться каждый будний день (для этого чата)."
+        )
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Для weekly/biweekly укажи день недели, например: /setdailyfreq weekly mon"
+        )
+        return
+    day = context.args[1].lower()
+    if day not in DAYS_MAP:
+        await update.message.reply_text("Неверный день. Используй mon,tue,wed,thu,fri,sat,sun")
+        return
+
+    chat_configs[chat_id]["daily_pick_freq"] = freq
+    chat_configs[chat_id]["daily_pick_day"] = day
+    schedule_daily_pick(context.application, chat_id)
+    save_state()
+    period = "раз в неделю" if freq == "weekly" else "раз в 2 недели"
+    await update.message.reply_text(
+        f"✅ Фасилитатор будет выбираться {period} ({day}) для этого чата."
+    )
+
+
+async def send_daily_facilitator_reminder(app, chat_id: int, text: str):
+    """Напоминание о дейли с тегом последнего выбранного рандомайзером фасилитатора.
+    Ведущий подставляется в момент отправки, а не при создании напоминания."""
+    leader = last_facilitators.get(chat_id)
+    safe_text = html.escape(text)
+    if leader:
+        msg = f"⏰ {member_mention(leader)} {safe_text}"
+    else:
+        msg = f"⏰ {safe_text}"
+    await app.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
+
+
+async def dailyreminder_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Формат: /dailyreminder ЧЧ:ММ Текст\n"
+            "Каждый будний день в указанное время тегает текущего ведущего дейли "
+            "(последнего, кого выбрал рандомайзер)."
+        )
+        return
+    try:
+        hour, minute = parse_time(context.args[0])
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError
+    except (ValueError, IndexError):
+        await update.message.reply_text("Неверный формат времени, нужно ЧЧ:ММ")
+        return
+    text = " ".join(context.args[1:])
+    chat_id = update.effective_chat.id
+    suffix = f"{hour:02d}{minute:02d}_{abs(hash(text)) % 100000}"
+    job_id = make_job_id("dailyfacilitator", chat_id, suffix)
+    scheduler.add_job(
+        send_daily_facilitator_reminder,
+        trigger=CronTrigger(
+            day_of_week="mon-fri", hour=hour, minute=minute, timezone=TIMEZONE
+        ),
+        args=[context.application, chat_id, text],
+        id=job_id,
+        replace_existing=True,
+    )
+    user_reminders[job_id] = {
+        "job_id": job_id, "type": "dailyfacilitator", "chat_id": chat_id,
+        "day": None, "hour": hour, "minute": minute, "text": text,
+    }
+    save_state()
+    await update.message.reply_text(
+        f"✅ Напоминание дейли с тегом ведущего (пн–пт в {hour:02d}:{minute:02d}) добавлено.\n"
+        f"ID: {job_id}"
+    )
 
 
 # ============================================================
@@ -1124,7 +1316,14 @@ async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• team_size: {cfg['team_size']}\n"
         f"• sprint_start: {cfg['sprint_start']}\n"
         f"• facilitators_enabled: {cfg.get('facilitators_enabled', DEFAULT_FACILITATORS_ENABLED)}\n"
-        f"• sprint_poll_time: {SPRINT_POLL_TIME}\n"
+        f"• daily_pick_time: {cfg.get('daily_pick_time', DEFAULT_DAILY_PICK_TIME)}\n"
+        f"• daily_pick_freq: {cfg.get('daily_pick_freq', DEFAULT_DAILY_PICK_FREQ)}"
+        + (
+            f" ({cfg.get('daily_pick_day', DEFAULT_DAILY_PICK_DAY)})\n"
+            if cfg.get('daily_pick_freq', DEFAULT_DAILY_PICK_FREQ) != "daily"
+            else "\n"
+        )
+        + f"• sprint_poll_time: {SPRINT_POLL_TIME}\n"
         f"• env_poll_time: {ENV_POLL_TIME}\n"
         f"• timezone: {TIMEZONE}"
     )
@@ -1725,7 +1924,7 @@ async def post_init(app):
     for chat_id in list(chat_configs.keys()):
         schedule_sprint_poll(app, chat_id)
         schedule_env_poll(app, chat_id)
-    schedule_daily_pick(app)
+        schedule_daily_pick(app, chat_id)
     schedule_birthday_check(app)
     restore_user_reminders(app)
     log.info("Scheduler started")
@@ -1755,6 +1954,9 @@ def main():
     app.add_handler(CommandHandler("enablefacilitators", enablefacilitators_cmd))
     app.add_handler(CommandHandler("addfacilitator", addfacilitator_cmd))
     app.add_handler(CommandHandler("removefacilitator", removefacilitator_cmd))
+    app.add_handler(CommandHandler("setdailytime", setdailytime_cmd))
+    app.add_handler(CommandHandler("setdailyfreq", setdailyfreq_cmd))
+    app.add_handler(CommandHandler("dailyreminder", dailyreminder_cmd))
 
     app.add_handler(CommandHandler("registertester", registertester_cmd))
     app.add_handler(CommandHandler("unregistertester", unregistertester_cmd))
