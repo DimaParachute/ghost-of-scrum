@@ -8,6 +8,7 @@ __pycache__/
 
 # Persistent state — содержит данные конкретной инсталляции, в репо не попадает.
 state.json
+*-state.json
 state*.bak.json
 state*.broken*
 
