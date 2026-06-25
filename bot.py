@@ -25,6 +25,7 @@ TIMEZONE = "Europe/Moscow"
 # Дефолты для нового чата (могут быть переопределены /setteamsize и /setsprintstart).
 DEFAULT_TEAM_SIZE = 6
 DEFAULT_SPRINT_START_DATE = "2026-04-29"
+DEFAULT_FACILITATORS_ENABLED = True
 
 # Время, в которое раз в 2 недели присылается голосование за спринт
 # (всегда в пятницу второй недели спринта)
@@ -58,6 +59,7 @@ def get_chat_config(chat_id: int) -> dict:
     return chat_configs.setdefault(chat_id, {
         "team_size": DEFAULT_TEAM_SIZE,
         "sprint_start": DEFAULT_SPRINT_START_DATE,
+        "facilitators_enabled": DEFAULT_FACILITATORS_ENABLED,
     })
 
 # Хранилище голосований за спринт.
@@ -210,6 +212,9 @@ def load_state():
         chat_configs[int(cid)] = {
             "team_size": cfg.get("team_size", DEFAULT_TEAM_SIZE),
             "sprint_start": cfg.get("sprint_start", DEFAULT_SPRINT_START_DATE),
+            "facilitators_enabled": cfg.get(
+                "facilitators_enabled", DEFAULT_FACILITATORS_ENABLED
+            ),
         }
 
     team_members.clear()
@@ -356,7 +361,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📌 В каждом рабочем чате (если у тебя их несколько — у каждой команды свой) "
         "выполни /setchat — тогда я начну присылать туда голосование за спринт.\n"
         "Снять чат с роли рабочего: /unsetchat (для админов).\n"
-        "Каждый чат имеет свои team_size и sprint_start.\n\n"
+        "Каждый чат имеет свои team_size, sprint_start и режим фасилитаторов.\n\n"
         "🛎 Команды напоминаний:\n"
         "/daily ЧЧ:ММ Текст — каждый будний день\n"
         "/weekly ДЕНЬ ЧЧ:ММ Текст — раз в неделю\n"
@@ -381,7 +386,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/addfacilitator (reply, для админов) — добавить того, на чьё сообщение отвечаешь\n"
         "/removefacilitator (reply, для админов) — удалить того, на чьё сообщение отвечаешь\n"
         "/dailymembers — показать список\n"
-        "/picknow — выбрать фасилитатора прямо сейчас (для теста)\n\n"
+        "/picknow — выбрать фасилитатора прямо сейчас (для теста)\n"
+        "/disablefacilitators — отключить выбор фасилитатора; дейли ведёт скрам-мастер\n"
+        "/enablefacilitators — вернуть выбор фасилитатора как сейчас\n"
+        "Если список фасилитаторов пуст — дейли ведёт скрам-мастер.\n\n"
         "🧭 Скрам-мастер (один на команду, ведёт планирование в пн):\n"
         "В пятницу в конце спринта вместо случайного фасилитатора тегается скрам-мастер.\n"
         "/registerscrum — зарегистрироваться скрам-мастером\n"
@@ -861,6 +869,22 @@ async def dailymembers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def send_daily_pick(app, chat_id: int):
+    cfg = chat_configs.get(chat_id, {})
+    if not cfg.get("facilitators_enabled", DEFAULT_FACILITATORS_ENABLED):
+        sm = scrum_masters.get(chat_id)
+        if not sm:
+            log.info(
+                "Skipping daily pick for chat %s — facilitators disabled, no scrum-master",
+                chat_id,
+            )
+            return
+        await app.bot.send_message(
+            chat_id=chat_id,
+            text=f"🧭 Дейли ведёт скрам-мастер: {member_mention(sm)}",
+            parse_mode="HTML",
+        )
+        return
+
     # В пятницу в конце спринта — следующий дейли это планирование, ведёт скрам-мастер.
     if is_sprint_last_friday(chat_id):
         sm = scrum_masters.get(chat_id)
@@ -878,7 +902,18 @@ async def send_daily_pick(app, chat_id: int):
 
     members = team_members.get(chat_id, [])
     if not members:
-        log.info("Skipping daily pick for chat %s — no members", chat_id)
+        sm = scrum_masters.get(chat_id)
+        if sm:
+            await app.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "Список фасилитаторов пуст.\n"
+                    f"🧭 Дейли ведёт скрам-мастер: {member_mention(sm)}"
+                ),
+                parse_mode="HTML",
+            )
+            return
+        log.info("Skipping daily pick for chat %s — no members and no scrum-master", chat_id)
         return
     chosen = random.choice(members)
     text = (
@@ -963,8 +998,52 @@ async def picknow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_daily_pick(context.application, update.effective_chat.id)
 
 
+async def disablefacilitators_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_chat_admin(update, context):
+        await update.message.reply_text("Эту команду могут использовать только админы чата.")
+        return
+    chat_id = update.effective_chat.id
+    if chat_id not in chat_configs:
+        await update.message.reply_text("Сначала сделай /setchat в этом чате.")
+        return
+
+    chat_configs[chat_id]["facilitators_enabled"] = False
+    save_state()
+
+    sm = scrum_masters.get(chat_id)
+    if sm:
+        await update.message.reply_text(
+            f"✅ Флоу фасилитаторов отключён. Дейли будет вести: {member_mention(sm)}",
+            parse_mode="HTML",
+        )
+    else:
+        await update.message.reply_text(
+            "✅ Флоу фасилитаторов отключён.\n"
+            "Скрам-мастер пока не зарегистрирован: пусть напишет /registerscrum."
+        )
+
+
+async def enablefacilitators_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_chat_admin(update, context):
+        await update.message.reply_text("Эту команду могут использовать только админы чата.")
+        return
+    chat_id = update.effective_chat.id
+    if chat_id not in chat_configs:
+        await update.message.reply_text("Сначала сделай /setchat в этом чате.")
+        return
+
+    chat_configs[chat_id]["facilitators_enabled"] = True
+    save_state()
+    await update.message.reply_text(
+        "✅ Флоу фасилитаторов включён. Бот будет выбирать из списка /dailymembers, "
+        "а если список пуст — тегать скрам-мастера."
+    )
+
+
 async def send_daily_pick_to_all(app):
-    for chat_id in list(team_members.keys()):
+    chat_ids = set(team_members.keys())
+    chat_ids.update(chat_configs.keys())
+    for chat_id in sorted(chat_ids):
         try:
             await send_daily_pick(app, chat_id)
         except Exception as e:
@@ -998,6 +1077,7 @@ async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• chat_id: {chat_id}\n"
         f"• team_size: {cfg['team_size']}\n"
         f"• sprint_start: {cfg['sprint_start']}\n"
+        f"• facilitators_enabled: {cfg.get('facilitators_enabled', DEFAULT_FACILITATORS_ENABLED)}\n"
         f"• sprint_poll_time: {SPRINT_POLL_TIME}\n"
         f"• env_poll_time: {ENV_POLL_TIME}\n"
         f"• timezone: {TIMEZONE}"
@@ -1612,6 +1692,8 @@ def main():
     app.add_handler(CommandHandler("leavedaily", leavedaily_cmd))
     app.add_handler(CommandHandler("dailymembers", dailymembers_cmd))
     app.add_handler(CommandHandler("picknow", picknow_cmd))
+    app.add_handler(CommandHandler("disablefacilitators", disablefacilitators_cmd))
+    app.add_handler(CommandHandler("enablefacilitators", enablefacilitators_cmd))
     app.add_handler(CommandHandler("addfacilitator", addfacilitator_cmd))
     app.add_handler(CommandHandler("removefacilitator", removefacilitator_cmd))
 
