@@ -26,6 +26,7 @@ from vacations import (
     today_vacations_text,
     unsetvacation_cmd,
     vacation_delete_callback,
+    vacationpdf_cmd,
     vacations_cmd,
 )
 
@@ -461,6 +462,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/setvacation [@username] YYYY-MM-DD YYYY-MM-DD — поставить отпуск\n"
         "/unsetvacation [@username] — выбрать отпуск для удаления\n"
         "/vacations [@username] — показать активные и будущие отпуска\n"
+        "/vacationpdf [YYYY] — PDF-календарь отпусков за год\n"
         "Другому человеку отпуск можно поставить/удалить через reply или @username, "
         "только для админов и владельца чата.\n\n"
         "⚙️ Настройки (применяются к текущему чату):\n"
@@ -1982,6 +1984,7 @@ def main():
     app.add_handler(CommandHandler("setvacation", setvacation_cmd))
     app.add_handler(CommandHandler("unsetvacation", unsetvacation_cmd))
     app.add_handler(CommandHandler("vacations", vacations_cmd))
+    app.add_handler(CommandHandler("vacationpdf", vacationpdf_cmd))
 
     app.add_handler(CommandHandler("settings", settings_cmd))
     app.add_handler(CommandHandler("setteamsize", setteamsize_cmd))
