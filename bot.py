@@ -906,7 +906,10 @@ async def send_daily_pick(app, chat_id: int):
         if sm:
             await app.bot.send_message(
                 chat_id=chat_id,
-                text=f"🧭 Дейли ведёт скрам-мастер: {member_mention(sm)}",
+                text=(
+                    "Список фасилитаторов пуст.\n"
+                    f"🧭 Дейли ведёт скрам-мастер: {member_mention(sm)}"
+                ),
                 parse_mode="HTML",
             )
             return
