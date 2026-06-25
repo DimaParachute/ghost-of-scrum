@@ -16,6 +16,19 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
+from vacations import (
+    configure as configure_vacations,
+    daily_scrum_master_text,
+    load_vacations,
+    serialize_vacations,
+    setvacation_cmd,
+    today_vacation_user_ids,
+    today_vacations_text,
+    unsetvacation_cmd,
+    vacation_delete_callback,
+    vacations_cmd,
+)
+
 # ============================================================
 # НАСТРОЙКИ
 # ============================================================
@@ -111,6 +124,7 @@ def _serialize_state() -> dict:
             str(cid): {str(uid): b for uid, b in chat_b.items()}
             for cid, chat_b in birthdays.items()
         },
+        "vacations": serialize_vacations(),
         "polls": [
             {
                 "poll_id": pid,
@@ -232,6 +246,8 @@ def load_state():
     birthdays.clear()
     for cid, chat_b in data.get("birthdays", {}).items():
         birthdays[int(cid)] = {int(uid): b for uid, b in chat_b.items()}
+
+    load_vacations(data.get("vacations", {}))
 
     polls.clear()
     for p in data.get("polls", []):
@@ -402,6 +418,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/removebirthday — удалить свой (или в reply — чужой, для админов)\n"
         "/birthdays — показать список\n"
         "/checkbirthdays — проверить и поздравить прямо сейчас (для теста)\n\n"
+        "🌴 Отпуска:\n"
+        "/setvacation [@username] YYYY-MM-DD YYYY-MM-DD — поставить отпуск\n"
+        "/unsetvacation [@username] — выбрать отпуск для удаления\n"
+        "/vacations [@username] — показать активные и будущие отпуска\n"
+        "Другому человеку отпуск можно поставить/удалить через reply или @username, "
+        "только для админов и владельца чата.\n\n"
         "⚙️ Настройки (применяются к текущему чату):\n"
         "/settings — показать настройки этого чата\n"
         "/setteamsize N — размер команды\n"
@@ -871,16 +893,10 @@ async def dailymembers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def send_daily_pick(app, chat_id: int):
     cfg = chat_configs.get(chat_id, {})
     if not cfg.get("facilitators_enabled", DEFAULT_FACILITATORS_ENABLED):
-        sm = scrum_masters.get(chat_id)
-        if not sm:
-            log.info(
-                "Skipping daily pick for chat %s — facilitators disabled, no scrum-master",
-                chat_id,
-            )
-            return
+        text = daily_scrum_master_text(chat_id)
         await app.bot.send_message(
             chat_id=chat_id,
-            text=f"🧭 Дейли ведёт скрам-мастер: {member_mention(sm)}",
+            text=text,
             parse_mode="HTML",
         )
         return
@@ -891,10 +907,7 @@ async def send_daily_pick(app, chat_id: int):
         if sm:
             await app.bot.send_message(
                 chat_id=chat_id,
-                text=(
-                    f"🧭 Следующий дейли — планирование нового спринта.\n"
-                    f"Ведёт скрам-мастер: {member_mention(sm)}"
-                ),
+                text=daily_scrum_master_text(chat_id, planning=True),
                 parse_mode="HTML",
             )
             return
@@ -902,23 +915,39 @@ async def send_daily_pick(app, chat_id: int):
 
     members = team_members.get(chat_id, [])
     if not members:
-        sm = scrum_masters.get(chat_id)
-        if sm:
+        text = daily_scrum_master_text(
+            chat_id,
+            prefix="Список фасилитаторов пуст.",
+            skip_without_scrum=True,
+        )
+        if text:
             await app.bot.send_message(
                 chat_id=chat_id,
-                text=(
-                    "Список фасилитаторов пуст.\n"
-                    f"🧭 Дейли ведёт скрам-мастер: {member_mention(sm)}"
-                ),
+                text=text,
                 parse_mode="HTML",
             )
             return
         log.info("Skipping daily pick for chat %s — no members and no scrum-master", chat_id)
         return
-    chosen = random.choice(members)
+
+    vacation_user_ids = today_vacation_user_ids(chat_id)
+    available_members = [m for m in members if m["user_id"] not in vacation_user_ids]
+    if not available_members:
+        await app.bot.send_message(
+            chat_id=chat_id,
+            text=daily_scrum_master_text(
+                chat_id,
+                prefix="🌴 Все фасилитаторы сегодня в отпуске.",
+            ),
+            parse_mode="HTML",
+        )
+        return
+
+    chosen = random.choice(available_members)
     text = (
         f"🎲 Следующий дейли проводит: {member_mention(chosen)}\n\n"
         f"Сможешь? Нажми кнопку ниже."
+        f"{today_vacations_text(chat_id)}"
     )
     msg = await app.bot.send_message(
         chat_id=chat_id,
@@ -970,12 +999,28 @@ async def daily_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if action == "no":
         pick["declined"].add(pick["current"])
-        candidates = [m for m in members if m["user_id"] not in pick["declined"]]
+        vacation_user_ids = today_vacation_user_ids(chat_id)
+        candidates = [
+            m for m in members
+            if m["user_id"] not in pick["declined"]
+            and m["user_id"] not in vacation_user_ids
+        ]
         if not candidates:
             del daily_picks[key]
             save_state()
+            if any(m["user_id"] in vacation_user_ids for m in members):
+                text = daily_scrum_master_text(
+                    chat_id,
+                    prefix="🌴 Все оставшиеся фасилитаторы сегодня в отпуске или уже отказались.",
+                )
+            else:
+                text = daily_scrum_master_text(
+                    chat_id,
+                    prefix="🤷 Все отказались.",
+                )
             await query.edit_message_text(
-                text="🤷 Все отказались. Договоритесь сами, кто проводит дейли."
+                text=text,
+                parse_mode="HTML",
             )
             await query.answer()
             return
@@ -987,6 +1032,7 @@ async def daily_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                 f"🔄 {member_mention(current_member) if current_member else 'Предыдущий'} не сможет.\n"
                 f"🎲 Замена: {member_mention(new_chosen)}\n\n"
                 f"Сможешь? Нажми кнопку ниже."
+                f"{today_vacations_text(chat_id)}"
             ),
             reply_markup=build_pick_keyboard(),
             parse_mode="HTML",
@@ -1660,6 +1706,19 @@ async def send_message(app, chat_id, text):
 # ============================================================
 # Entry
 # ============================================================
+configure_vacations(
+    save_state=save_state,
+    is_chat_admin=is_chat_admin,
+    reply_target_user=reply_target_user,
+    now_tz=now_tz,
+    member_mention=member_mention,
+    team_members=team_members,
+    testers=testers,
+    scrum_masters=scrum_masters,
+    birthdays=birthdays,
+)
+
+
 async def post_init(app):
     load_state()
     scheduler.start()
@@ -1718,6 +1777,10 @@ def main():
     app.add_handler(CommandHandler("birthdays", birthdays_cmd))
     app.add_handler(CommandHandler("checkbirthdays", checkbirthdays_cmd))
 
+    app.add_handler(CommandHandler("setvacation", setvacation_cmd))
+    app.add_handler(CommandHandler("unsetvacation", unsetvacation_cmd))
+    app.add_handler(CommandHandler("vacations", vacations_cmd))
+
     app.add_handler(CommandHandler("settings", settings_cmd))
     app.add_handler(CommandHandler("setteamsize", setteamsize_cmd))
     app.add_handler(CommandHandler("setsprintstart", setsprintstart_cmd))
@@ -1725,6 +1788,7 @@ def main():
     app.add_handler(CallbackQueryHandler(vote_callback, pattern=r"^vote:"))
     app.add_handler(CallbackQueryHandler(daily_pick_callback, pattern=r"^dpick:"))
     app.add_handler(CallbackQueryHandler(env_vote_callback, pattern=r"^envvote:"))
+    app.add_handler(CallbackQueryHandler(vacation_delete_callback, pattern=r"^vacdel:"))
 
     print("Бот запущен...")
     app.run_polling()
