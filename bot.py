@@ -41,7 +41,7 @@ DEFAULT_TEAM_SIZE = 6
 DEFAULT_SPRINT_START_DATE = "2026-04-29"
 DEFAULT_FACILITATORS_ENABLED = True
 
-# Время выбора случайного фасилитатора дейли. Настраивается /setdailytime.
+# Время выбора фасилитатора дейли. Настраивается /setdailytime.
 DEFAULT_DAILY_PICK_TIME = "11:15"
 
 # Периодичность выбора фасилитатора: "daily" (каждый будний день),
@@ -433,7 +433,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/testers — показать список тестировщиков\n"
         "/startenvpoll — запустить голосование по тестовой среде вручную\n"
         "/closeenvpoll — досрочно закрыть голосование и показать среднее\n\n"
-        "🎲 Случайный фасилитатор дейли (по умолчанию каждый будний день; время — /setdailytime, периодичность — /setdailyfreq):\n"
+        "🎲 Выбор фасилитатора дейли (по умолчанию каждый будний день; время — /setdailytime, периодичность — /setdailyfreq):\n"
         "/joindaily — добавить себя в список фасилитаторов\n"
         "/leavedaily — убрать себя из списка\n"
         "/addfacilitator (reply, для админов) — добавить того, на чьё сообщение отвечаешь\n"
@@ -442,8 +442,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/picknow — выбрать фасилитатора прямо сейчас (для теста)\n"
         "/setdailytime ЧЧ:ММ — время выбора фасилитатора (для админов)\n"
         "/setdailyfreq daily|weekly ДЕНЬ|biweekly ДЕНЬ — как часто выбирать фасилитатора (для админов)\n"
-        "/dailyreminder ЧЧ:ММ Текст — напоминание о дейли с тегом текущего ведущего (пн–пт)\n"
-        "/disablefacilitators — отключить выбор фасилитатора; дейли ведёт скрам-мастер\n"
+        "/dailyreminder ЧЧ:ММ Текст — напоминание с текстом, ссылкой, тегом ведущего и отпусками (пн–пт)\n"
+        "/dailyremindernow [Текст] — отправить такое напоминание вручную прямо сейчас\n"
+        "/disablefacilitators — отключить выбор фасилитатора; /dailyreminder будет тегать скрам-мастера\n"
         "/enablefacilitators — вернуть выбор фасилитатора как сейчас\n"
         "Если список фасилитаторов пуст — дейли ведёт скрам-мастер.\n\n"
         "🧭 Скрам-мастер (один на команду, ведёт планирование в пн):\n"
@@ -932,15 +933,17 @@ async def dailymembers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+def stop_daily_picks(chat_id: int) -> int:
+    keys = [key for key in daily_picks if key[0] == chat_id]
+    for key in keys:
+        del daily_picks[key]
+    return len(keys)
+
+
 async def send_daily_pick(app, chat_id: int):
     cfg = chat_configs.get(chat_id, {})
     if not cfg.get("facilitators_enabled", DEFAULT_FACILITATORS_ENABLED):
-        text = daily_scrum_master_text(chat_id)
-        await app.bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            parse_mode="HTML",
-        )
+        log.info("Skipping daily facilitator pick for chat %s — facilitators disabled", chat_id)
         return
 
     # В пятницу в конце спринта — следующий дейли это планирование, ведёт скрам-мастер.
@@ -1019,6 +1022,15 @@ async def daily_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not pick:
         await query.answer("Это сообщение больше не активно.", show_alert=True)
         return
+    cfg = chat_configs.get(chat_id, {})
+    if not cfg.get("facilitators_enabled", DEFAULT_FACILITATORS_ENABLED):
+        del daily_picks[key]
+        save_state()
+        await query.edit_message_text(
+            text="Флоу фасилитаторов отключён. Это сообщение больше не активно."
+        )
+        await query.answer("Флоу фасилитаторов отключён.", show_alert=True)
+        return
     if pick["confirmed"]:
         await query.answer("Уже подтверждено.", show_alert=True)
         return
@@ -1085,6 +1097,14 @@ async def daily_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def picknow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    cfg = chat_configs.get(chat_id, {})
+    if not cfg.get("facilitators_enabled", DEFAULT_FACILITATORS_ENABLED):
+        await update.message.reply_text(
+            "Флоу фасилитаторов отключён, /picknow не запускаю.\n"
+            "Для напоминания о дейли используй /dailyreminder — там можно указать текст и ссылку."
+        )
+        return
     await send_daily_pick(context.application, update.effective_chat.id)
 
 
@@ -1098,18 +1118,24 @@ async def disablefacilitators_cmd(update: Update, context: ContextTypes.DEFAULT_
         return
 
     chat_configs[chat_id]["facilitators_enabled"] = False
+    stopped_picks = stop_daily_picks(chat_id)
+    schedule_daily_pick(context.application, chat_id)
     save_state()
+    stopped_text = "\nАктивный выбор фасилитатора остановлен." if stopped_picks else ""
 
     sm = scrum_masters.get(chat_id)
     if sm:
         await update.message.reply_text(
-            f"✅ Флоу фасилитаторов отключён. Дейли будет вести: {member_mention(sm)}",
+            "✅ Флоу фасилитаторов отключён.\n"
+            f"/dailyreminder будет тегать скрам-мастера: {member_mention(sm)}"
+            f"{stopped_text}",
             parse_mode="HTML",
         )
     else:
         await update.message.reply_text(
             "✅ Флоу фасилитаторов отключён.\n"
             "Скрам-мастер пока не зарегистрирован: пусть напишет /registerscrum."
+            f"{stopped_text}"
         )
 
 
@@ -1123,6 +1149,7 @@ async def enablefacilitators_cmd(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     chat_configs[chat_id]["facilitators_enabled"] = True
+    schedule_daily_pick(context.application, chat_id)
     save_state()
     await update.message.reply_text(
         "✅ Флоу фасилитаторов включён. Бот будет выбирать из списка /dailymembers, "
@@ -1134,10 +1161,16 @@ def schedule_daily_pick(app, chat_id: int):
     if chat_id not in chat_configs:
         return
     cfg = chat_configs[chat_id]
+    job_id = f"daily_pick__{chat_id}"
+    if not cfg.get("facilitators_enabled", DEFAULT_FACILITATORS_ENABLED):
+        if scheduler.get_job(job_id):
+            scheduler.remove_job(job_id)
+        log.info("Daily facilitator pick disabled for chat %s", chat_id)
+        return
+
     hour, minute = parse_time(cfg.get("daily_pick_time", DEFAULT_DAILY_PICK_TIME))
     freq = cfg.get("daily_pick_freq", DEFAULT_DAILY_PICK_FREQ)
     day = cfg.get("daily_pick_day", DEFAULT_DAILY_PICK_DAY)
-    job_id = f"daily_pick__{chat_id}"
 
     if freq == "weekly":
         trigger = CronTrigger(
@@ -1175,14 +1208,14 @@ async def setdailytime_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Эту команду могут использовать только админы чата.")
         return
     if not context.args:
-        await update.message.reply_text("Формат: /setdailytime ЧЧ:ММ (например 11:59)")
+        await update.message.reply_text("Формат: /setdailytime ЧЧ:ММ (например 11:15)")
         return
     try:
         hour, minute = parse_time(context.args[0])
         if not (0 <= hour <= 23 and 0 <= minute <= 59):
             raise ValueError
     except (ValueError, IndexError):
-        await update.message.reply_text("Неверный формат времени, нужно ЧЧ:ММ (например 11:59).")
+        await update.message.reply_text("Неверный формат времени, нужно ЧЧ:ММ (например 11:15).")
         return
     chat_id = update.effective_chat.id
     if chat_id not in chat_configs:
@@ -1191,8 +1224,12 @@ async def setdailytime_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_configs[chat_id]["daily_pick_time"] = f"{hour:02d}:{minute:02d}"
     schedule_daily_pick(context.application, chat_id)
     save_state()
+    suffix = ""
+    if not chat_configs[chat_id].get("facilitators_enabled", DEFAULT_FACILITATORS_ENABLED):
+        suffix = "\nФлоу фасилитаторов выключен, поэтому крон выбора не запущен."
     await update.message.reply_text(
         f"✅ Время выбора фасилитатора дейли = {hour:02d}:{minute:02d} (для этого чата)"
+        f"{suffix}"
     )
 
 
@@ -1225,8 +1262,11 @@ async def setdailyfreq_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_configs[chat_id]["daily_pick_freq"] = "daily"
         schedule_daily_pick(context.application, chat_id)
         save_state()
+        suffix = ""
+        if not chat_configs[chat_id].get("facilitators_enabled", DEFAULT_FACILITATORS_ENABLED):
+            suffix = "\nФлоу фасилитаторов выключен, поэтому крон выбора не запущен."
         await update.message.reply_text(
-            "✅ Фасилитатор будет выбираться каждый будний день (для этого чата)."
+            f"✅ Фасилитатор будет выбираться каждый будний день (для этого чата).{suffix}"
         )
         return
 
@@ -1245,20 +1285,55 @@ async def setdailyfreq_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     schedule_daily_pick(context.application, chat_id)
     save_state()
     period = "раз в неделю" if freq == "weekly" else "раз в 2 недели"
+    suffix = ""
+    if not chat_configs[chat_id].get("facilitators_enabled", DEFAULT_FACILITATORS_ENABLED):
+        suffix = "\nФлоу фасилитаторов выключен, поэтому крон выбора не запущен."
     await update.message.reply_text(
-        f"✅ Фасилитатор будет выбираться {period} ({day}) для этого чата."
+        f"✅ Фасилитатор будет выбираться {period} ({day}) для этого чата.{suffix}"
     )
 
 
-async def send_daily_facilitator_reminder(app, chat_id: int, text: str):
-    """Напоминание о дейли с тегом последнего выбранного рандомайзером фасилитатора.
-    Ведущий подставляется в момент отправки, а не при создании напоминания."""
-    leader = last_facilitators.get(chat_id)
+def daily_reminder_text(chat_id: int, text: str) -> str:
     safe_text = html.escape(text)
-    if leader:
-        msg = f"⏰ {member_mention(leader)} {safe_text}"
-    else:
-        msg = f"⏰ {safe_text}"
+    cfg = chat_configs.get(chat_id, {})
+    vacation_user_ids = today_vacation_user_ids(chat_id)
+
+    if not cfg.get("facilitators_enabled", DEFAULT_FACILITATORS_ENABLED):
+        sm = scrum_masters.get(chat_id)
+        if not sm:
+            lines = [
+                f"⏰ {safe_text}",
+                "Скрам-мастер не зарегистрирован.",
+                "Договоритесь сами, кто ведёт дейли.",
+            ]
+        elif sm["user_id"] in vacation_user_ids:
+            name = html.escape(sm["full_name"])
+            lines = [
+                f"⏰ {safe_text}",
+                f"🌴 Скрам-мастер сегодня в отпуске: {name}.",
+                "Договоритесь сами, кто ведёт дейли.",
+            ]
+        else:
+            lines = [f"⏰ {member_mention(sm)} {safe_text}"]
+        return "\n".join(lines) + today_vacations_text(chat_id)
+
+    leader = last_facilitators.get(chat_id)
+    if not leader:
+        return f"⏰ {safe_text}{today_vacations_text(chat_id)}"
+    if leader["user_id"] in vacation_user_ids:
+        name = html.escape(leader["full_name"])
+        lines = [
+            f"⏰ {safe_text}",
+            f"🌴 Текущий ведущий сегодня в отпуске: {name}.",
+            "Договоритесь сами, кто ведёт дейли.",
+        ]
+        return "\n".join(lines) + today_vacations_text(chat_id)
+    return f"⏰ {member_mention(leader)} {safe_text}{today_vacations_text(chat_id)}"
+
+
+async def send_daily_facilitator_reminder(app, chat_id: int, text: str):
+    """Короткое напоминание. Ведущий подставляется в момент отправки."""
+    msg = daily_reminder_text(chat_id, text)
     await app.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
 
 
@@ -1267,7 +1342,7 @@ async def dailyreminder_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "Формат: /dailyreminder ЧЧ:ММ Текст\n"
             "Каждый будний день в указанное время тегает текущего ведущего дейли "
-            "(последнего, кого выбрал рандомайзер)."
+            "и показывает сегодняшние отпуска."
         )
         return
     try:
@@ -1299,6 +1374,12 @@ async def dailyreminder_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ Напоминание дейли с тегом ведущего (пн–пт в {hour:02d}:{minute:02d}) добавлено.\n"
         f"ID: {job_id}"
     )
+
+
+async def dailyremindernow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = " ".join(context.args).strip() or "Дейли"
+    msg = daily_reminder_text(update.effective_chat.id, text)
+    await update.message.reply_text(msg, parse_mode="HTML")
 
 
 # ============================================================
@@ -1959,6 +2040,7 @@ def main():
     app.add_handler(CommandHandler("setdailytime", setdailytime_cmd))
     app.add_handler(CommandHandler("setdailyfreq", setdailyfreq_cmd))
     app.add_handler(CommandHandler("dailyreminder", dailyreminder_cmd))
+    app.add_handler(CommandHandler("dailyremindernow", dailyremindernow_cmd))
 
     app.add_handler(CommandHandler("registertester", registertester_cmd))
     app.add_handler(CommandHandler("unregistertester", unregistertester_cmd))
